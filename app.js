@@ -463,7 +463,7 @@ async function buildLandscapeCanvas() {
   const updatedText = `Updated: ${now.toISOString().slice(0, 16).replace("T", " ")}`;
   ctx.font = fontSpec(SMALL_SIZE);
   const { h: updH } = textSize(ctx, updatedText);
-  const updX = margin;
+  const updX = CANVAS_WIDTH / 2 + margin;
   const updY = CANVAS_HEIGHT - margin - updH;
   ctx.fillText(updatedText, updX, updY);
 
