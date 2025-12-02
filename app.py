@@ -2,7 +2,7 @@
 import os
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
-from typing import Tuple, Any, Dict, List
+from typing import Tuple, Any, Dict
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
@@ -17,7 +17,8 @@ UL_ENTITY = os.environ.get("UL_ENTITY", "sensor.transmission_upload_speed")
 BIND_HOST = os.environ.get("BIND_HOST", "0.0.0.0")
 BIND_PORT = int(os.environ.get("BIND_PORT", "8080"))
 
-WIDTH, HEIGHT = 600, 800
+# Logical canvas in LANDSCAPE. We’ll rotate it at the end to 600x800 portrait.
+CANVAS_WIDTH, CANVAS_HEIGHT = 800, 600
 
 HEADERS = {
     "Authorization": f"Bearer {HA_TOKEN}",
@@ -26,7 +27,7 @@ HEADERS = {
 
 
 # ===== Helpers =====
-def get_font(size: int) -> ImageFont.FreeTypeFont:
+def get_font(size: int) -> ImageFont.ImageFont:
     """Try to load DejaVuSans, fall back to default bitmap font."""
     try:
         return ImageFont.truetype("DejaVuSans.ttf", size)
@@ -34,8 +35,10 @@ def get_font(size: int) -> ImageFont.FreeTypeFont:
         return ImageFont.load_default()
 
 
-def text_size(draw, text: str, font):
+def text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont):
     """Replacement for deprecated draw.textsize using textbbox."""
+    if text is None:
+        text = ""
     bbox = draw.textbbox((0, 0), text, font=font)
     w = bbox[2] - bbox[0]
     h = bbox[3] - bbox[1]
@@ -68,6 +71,8 @@ def icon_for_condition(condition: str) -> str:
         "lightning-rainy": "⛈",
         "windy": "🌀",
         "fog": "〰",
+        "windy-variant": "🌀☁",
+        "exceptional": "!",
     }
     for key, icon in mapping.items():
         if condition.startswith(key):
@@ -86,60 +91,72 @@ def format_speed(state: str, attrs: Dict[str, Any]) -> str:
         return f"{state} {unit}".strip()
 
 
-def parse_forecast(attrs: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Return first 5 daily entries with parsed datetime & temps."""
-    fc = attrs.get("forecast") or []
-    out = []
-    for entry in fc[:5]:
-        dt_raw = entry.get("datetime") or entry.get("time")
-        try:
-            dt = datetime.fromisoformat(dt_raw.replace("Z", "+00:00"))
-        except Exception:
-            dt = None
-        out.append(
-            {
-                "dt": dt,
-                "day": dt.strftime("%a") if dt else "",
-                "temp": entry.get("temperature"),
-                "templow": entry.get("templow") or entry.get("temperature"),
-                "condition": entry.get("condition") or "",
-            }
-        )
-    return out
+def fit_text_in_box(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    box: Tuple[int, int, int, int],
+    max_size: int,
+    min_size: int,
+) -> Tuple[ImageFont.ImageFont, int, int]:
+    """
+    Find the largest font size between max_size and min_size
+    such that `text` fits inside `box` (left, top, right, bottom).
+    Returns (font, text_width, text_height).
+    """
+    left, top, right, bottom = box
+    box_w = max(1, right - left)
+    box_h = max(1, bottom - top)
+
+    for size in range(max_size, min_size - 1, -2):
+        font = get_font(size)
+        w, h = text_size(draw, text, font)
+        if w <= box_w and h <= box_h:
+            return font, w, h
+
+    # Fallback to min_size if nothing fit
+    font = get_font(min_size)
+    w, h = text_size(draw, text, font)
+    return font, w, h
 
 
 def build_image_bytes() -> bytes:
-    img = Image.new("L", (WIDTH, HEIGHT), 255)  # white background
+    img = Image.new("L", (CANVAS_WIDTH, CANVAS_HEIGHT), 255)  # white background, LANDSCAPE
     draw = ImageDraw.Draw(img)
 
-    title_font = get_font(32)
-    cond_font = get_font(28)
-    big_temp_font = get_font(72)
-    label_font = get_font(20)
-    small_font = get_font(16)
+    # Fonts for fixed-size text
+    cond_font = get_font(56)
+    detail_font = get_font(32)
+    tx_label_font = get_font(30)
+    tx_value_font = get_font(28)
+    small_font = get_font(20)
 
-    margin = 20
+    margin = 24
+    split_x = 420  # left/right column boundary
 
+    # ===== Fetch data =====
     try:
         weather_state, w_attrs = ha_state(WEATHER_ENTITY)
     except Exception as e:
-        # If weather fails, just show error
-        draw.text((margin, margin), "Error reading weather", font=title_font, fill=0)
+        draw.text((margin, margin), "Error reading weather", font=detail_font, fill=0)
         draw.text((margin, margin + 40), str(e), font=small_font, fill=0)
-        return img.tobytes()
+        rotated_err = img.rotate(-90, expand=True)  # rotate so USB is on the right
+        return rotated_err.tobytes()
 
-    # Current weather details
-    location = w_attrs.get("friendly_name", WEATHER_ENTITY)
     condition = weather_state
     temp = w_attrs.get("temperature")
     temp_unit = w_attrs.get("temperature_unit", "°C")
-    pressure = w_attrs.get("pressure")
-    humidity = w_attrs.get("humidity")
-    wind_speed = w_attrs.get("wind_speed")
-    wind_bearing = w_attrs.get("wind_bearing")
-    forecast = parse_forecast(w_attrs)
 
-    # Transmission speeds
+    humidity = w_attrs.get("humidity")
+    pressure = w_attrs.get("pressure")
+    wind_speed = w_attrs.get("wind_speed") or w_attrs.get("native_wind_speed")
+    wind_speed_unit = (
+        w_attrs.get("wind_speed_unit") or w_attrs.get("native_wind_speed_unit") or "m/s"
+    )
+    wind_bearing = w_attrs.get("wind_bearing")
+    cloud_coverage = w_attrs.get("cloud_coverage")
+    uv_index = w_attrs.get("uv_index")
+
+    # Transmission
     try:
         dl_state, dl_attrs = ha_state(DL_ENTITY)
         ul_state, ul_attrs = ha_state(UL_ENTITY)
@@ -149,128 +166,118 @@ def build_image_bytes() -> bytes:
         dl_text = "ERR"
         ul_text = "ERR"
 
-    # ===== Layout =====
+    # ===== LEFT COLUMN: condition + details + transmission + updated =====
+    x_left = margin
     y = margin
 
-    # Header: location
-    draw.text((margin, y), location, font=title_font, fill=0)
-
-    # Right side: DL/UL small panel
-    tx_label = "Transmission"
-    tx_w, _ = text_size(draw, tx_label, label_font)
-    tx_x = WIDTH - margin - tx_w
-    draw.text((tx_x, y), tx_label, font=label_font, fill=0)
-    y_tx = y + label_font.size + 4
-    draw.text((tx_x, y_tx), f"DL: {dl_text}", font=small_font, fill=0)
-    y_tx += small_font.size + 2
-    draw.text((tx_x, y_tx), f"UL: {ul_text}", font=small_font, fill=0)
-
-    y += title_font.size + 10
-
-    # Condition + icon
-    icon = icon_for_condition(condition)
-    icon_font = get_font(48)
-
+    # Condition, big
     cond_text = condition.capitalize()
-    draw.text((margin, y), cond_text, font=cond_font, fill=0)
+    draw.text((x_left, y), cond_text, font=cond_font, fill=0)
+    y += cond_font.size + 16
 
-    icon_w, icon_h = text_size(draw, icon, icon_font)
-    draw.text(
-        (margin, y + cond_font.size + 5),
-        icon,
-        font=icon_font,
-        fill=0,
-    )
+    def add_detail(label: str, value: str):
+        nonlocal y
+        text = f"{label}: {value}"
+        draw.text((x_left, y), text, font=detail_font, fill=0)
+        y += detail_font.size + 8
 
-    # Big current temperature on the right
-    temp_str = "—"
+    if humidity is not None:
+        add_detail("Humidity", f"{humidity}%")
+
+    if pressure is not None:
+        add_detail("Pressure", f"{pressure} hPa")
+
+    if wind_speed is not None:
+        try:
+            ws_val = float(wind_speed)
+            ws_str = f"{ws_val:.1f} {wind_speed_unit}"
+        except Exception:
+            ws_str = f"{wind_speed} {wind_speed_unit}"
+        bearing = f" ({wind_bearing})" if wind_bearing else ""
+        add_detail("Wind", f"{ws_str}{bearing}")
+
+    if cloud_coverage is not None:
+        add_detail("Clouds", f"{cloud_coverage}%")
+
+    if uv_index is not None:
+        add_detail("UV Index", str(uv_index))
+
+    # Transmission block below details
+    y += 16
+    draw.text((x_left, y), "Transmission:", font=tx_label_font, fill=0)
+    y += tx_label_font.size + 6
+    draw.text((x_left, y), f"Up: {ul_text}", font=tx_value_font, fill=0)
+    y += tx_value_font.size + 4
+    draw.text((x_left, y), f"Down: {dl_text}", font=tx_value_font, fill=0)
+
+    # Updated timestamp at the very bottom-left
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    updated_text = f"Updated: {now}"
+    upd_w, upd_h = text_size(draw, updated_text, small_font)
+    upd_x = x_left
+    upd_y = CANVAS_HEIGHT - margin - upd_h
+    draw.text((upd_x, upd_y), updated_text, font=small_font, fill=0)
+
+    # ===== RIGHT COLUMN TOP: huge temperature (dynamically sized) =====
     if temp is not None:
         try:
             temp_str = f"{float(temp):.0f}{temp_unit}"
         except Exception:
             temp_str = f"{temp}{temp_unit}"
+    else:
+        temp_str = "—"
 
-    tw, th = text_size(draw, temp_str, big_temp_font)
-    temp_x = WIDTH - margin - tw
-    temp_y = y + 10
-    draw.text((temp_x, temp_y), temp_str, font=big_temp_font, fill=0)
+    temp_box_left = split_x + 10
+    temp_box_top = margin
+    temp_box_right = CANVAS_WIDTH - margin
+    temp_box_bottom = CANVAS_HEIGHT // 2 - 10  # top half of the right side
 
-    # Meta line: updated time
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    y_meta = temp_y + th + 5
-    draw.text((margin, y_meta), f"Updated: {now}", font=small_font, fill=0)
+    temp_font, temp_w, temp_h = fit_text_in_box(
+        draw,
+        temp_str,
+        (temp_box_left, temp_box_top, temp_box_right, temp_box_bottom),
+        max_size=180,
+        min_size=80,
+    )
 
-    # Details: pressure / humidity / wind
-    y_details = y_meta + small_font.size + 10
-    if pressure is not None:
-        draw.text(
-            (margin, y_details),
-            f"Pressure: {pressure} hPa",
-            font=label_font,
-            fill=0,
-        )
-        y_details += label_font.size + 4
-    if humidity is not None:
-        draw.text(
-            (margin, y_details),
-            f"Humidity: {humidity}%",
-            font=label_font,
-            fill=0,
-        )
-        y_details += label_font.size + 4
-    if wind_speed is not None:
-        try:
-            ws_val = float(wind_speed)
-            ws = f"{ws_val:.1f} m/s"
-        except Exception:
-            ws = f"{wind_speed} m/s"
-        bearing = f" ({wind_bearing})" if wind_bearing else ""
-        draw.text(
-            (margin, y_details),
-            f"Wind: {ws}{bearing}",
-            font=label_font,
-            fill=0,
-        )
+    temp_cx = (temp_box_left + temp_box_right) // 2
+    temp_cy = (temp_box_top + temp_box_bottom) // 2
+    temp_x = temp_cx - temp_w // 2
+    temp_y = temp_cy - temp_h // 2
+    draw.text((temp_x, temp_y), temp_str, font=temp_font, fill=0)
 
-    # Bottom forecast strip
-    if forecast:
-        base_y = HEIGHT - 180
-        draw.line((margin, base_y - 10, WIDTH - margin, base_y - 10), fill=0)
-        draw.text((margin, base_y - 28), "Daily forecast", font=label_font, fill=0)
+    # ===== RIGHT COLUMN: big weather icon just under temp =====
+    icon = icon_for_condition(condition)
 
-        col_width = (WIDTH - 2 * margin) / max(1, len(forecast))
-        for i, entry in enumerate(forecast):
-            x_center = margin + col_width * (i + 0.5)
-            day = entry["day"]
-            hi = entry["temp"]
-            lo = entry["templow"]
-            cond = entry["condition"]
-            icon_small = icon_for_condition(cond)
+    # Icon box starts a bit below the actual rendered temp glyph, and
+    # stops a bit above the very bottom so it doesn't get clipped.
+    icon_box_left = split_x + 10
+    icon_box_top = temp_y + temp_h + 20
+    icon_box_right = CANVAS_WIDTH - margin
+    icon_box_bottom = CANVAS_HEIGHT - margin - 40
 
-            # Day name
-            text = day
-            w, h = text_size(draw, text, small_font)
-            draw.text((x_center - w / 2, base_y), text, font=small_font, fill=0)
+    # Guard in case temp eats more space than expected
+    if icon_box_bottom <= icon_box_top + 20:
+        icon_box_top = CANVAS_HEIGHT // 2 + 10
+        icon_box_bottom = CANVAS_HEIGHT - margin - 40
 
-            # Icon
-            w, h = text_size(draw, icon_small, small_font)
-            draw.text((x_center - w / 2, base_y + h + 2), icon_small, font=small_font, fill=0)
+    icon_font, icon_w, icon_h = fit_text_in_box(
+        draw,
+        icon,
+        (icon_box_left, icon_box_top, icon_box_right, icon_box_bottom),
+        max_size=260,  # let it get quite large
+        min_size=80,
+    )
 
-            # Hi / lo
-            if isinstance(hi, (int, float)):
-                hi_str = f"{hi:.0f}"
-            else:
-                hi_str = str(hi)
-            if isinstance(lo, (int, float)):
-                lo_str = f"{lo:.0f}"
-            else:
-                lo_str = str(lo)
+    icon_cx = (icon_box_left + icon_box_right) // 2
+    icon_cy = (icon_box_top + icon_box_bottom) // 2
+    icon_x = icon_cx - icon_w // 2
+    icon_y = icon_cy - icon_h // 2
+    draw.text((icon_x, icon_y), icon, font=icon_font, fill=0)
 
-            hi_lo = f"{hi_str}/{lo_str}"
-            w, h2 = text_size(draw, hi_lo, small_font)
-            draw.text((x_center - w / 2, base_y + h + h2 + 6), hi_lo, font=small_font, fill=0)
-
-    return img.tobytes()
+    # Rotate entire landscape canvas -90° so USB is on the right in widescreen
+    rotated = img.rotate(-90, expand=True)
+    return rotated.tobytes()
 
 
 # ===== HTTP server =====
@@ -301,7 +308,10 @@ class RawHandler(BaseHTTPRequestHandler):
 
 def main():
     server = HTTPServer((BIND_HOST, BIND_PORT), RawHandler)
-    print(f"Serving Kobo dashboard on {BIND_HOST}:{BIND_PORT}/kobo-dashboard.raw")
+    print(
+        f"Serving Kobo dashboard on {BIND_HOST}:{BIND_PORT}/kobo-dashboard.raw "
+        f"(canvas {CANVAS_WIDTH}x{CANVAS_HEIGHT} rotated to 600x800, USB on right)"
+    )
     server.serve_forever()
 
 
