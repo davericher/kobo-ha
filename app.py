@@ -3,6 +3,7 @@ import os
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 from typing import Tuple, Any, Dict
+from io import BytesIO
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
@@ -10,9 +11,15 @@ from PIL import Image, ImageDraw, ImageFont
 # ===== Config via environment variables =====
 HA_URL = os.environ.get("HA_URL", "http://homeassistant:8123").rstrip("/")
 HA_TOKEN = os.environ.get("HA_TOKEN", "")
+
 WEATHER_ENTITY = os.environ.get("WEATHER_ENTITY", "weather.ironynet")
 DL_ENTITY = os.environ.get("DL_ENTITY", "sensor.transmission_download_speed")
 UL_ENTITY = os.environ.get("UL_ENTITY", "sensor.transmission_upload_speed")
+
+# New: inside sensors
+INSIDE_TEMP_ENTITY = os.environ.get("INSIDE_TEMP_ENTITY", "")          # e.g. sensor.living_room_temperature
+INSIDE_HUMIDITY_ENTITY = os.environ.get("INSIDE_HUMIDITY_ENTITY", "")  # e.g. sensor.living_room_humidity
+HOTTUB_TEMP_ENTITY = os.environ.get("HOTTUB_TEMP_ENTITY", "")          # e.g. sensor.hot_tub_temperature
 
 BIND_HOST = os.environ.get("BIND_HOST", "0.0.0.0")
 BIND_PORT = int(os.environ.get("BIND_PORT", "8080"))
@@ -119,6 +126,66 @@ def fit_text_in_box(
     return font, w, h
 
 
+def numeric_state(entity_id: str):
+    """
+    Read a numeric sensor: returns (value_float_or_None, unit_or_None, attrs_dict)
+    """
+    if not entity_id:
+        return None, None, {}
+    try:
+        state, attrs = ha_state(entity_id)
+        if state in ("unknown", "unavailable", None):
+            return None, attrs.get("unit_of_measurement"), attrs
+        value = float(state)
+        unit = attrs.get("unit_of_measurement")
+        return value, unit, attrs
+    except Exception:
+        return None, None, {}
+
+
+def draw_weather_icon(img: Image.Image,
+                      draw: ImageDraw.ImageDraw,
+                      box: Tuple[int, int, int, int],
+                      condition: str,
+                      w_attrs: Dict[str, Any]):
+    """
+    Try to draw a real icon image from weather.entity_picture.
+    Fallback to a big text glyph based on the condition.
+    `box` is (left, top, right, bottom).
+    """
+    left, top, right, bottom = box
+    box_w = max(1, right - left)
+    box_h = max(1, bottom - top)
+
+    icon_url = w_attrs.get("entity_picture")
+    if icon_url:
+        if icon_url.startswith("/"):
+            icon_url = f"{HA_URL}{icon_url}"
+        try:
+            r = requests.get(icon_url, headers=HEADERS, timeout=5)
+            r.raise_for_status()
+            ico = Image.open(BytesIO(r.content)).convert("L")
+            # Scale to fit box while preserving aspect ratio
+            ico.thumbnail((box_w, box_h), Image.LANCZOS)
+            iw, ih = ico.size
+            px = left + (box_w - iw) // 2
+            py = top + (box_h - ih) // 2
+            img.paste(ico, (px, py))
+            return
+        except Exception:
+            # Fall back to glyph on any error
+            pass
+
+    # Fallback: big unicode glyph
+    glyph = icon_for_condition(condition)
+    font, tw, th = fit_text_in_box(draw, glyph, box, max_size=260, min_size=80)
+    cx = (left + right) // 2
+    cy = (top + bottom) // 2
+    x = cx - tw // 2
+    y = cy - th // 2
+    draw.text((x, y), glyph, font=font, fill=0)
+
+
 def build_image_bytes() -> bytes:
     img = Image.new("L", (CANVAS_WIDTH, CANVAS_HEIGHT), 255)  # white background, LANDSCAPE
     draw = ImageDraw.Draw(img)
@@ -126,14 +193,17 @@ def build_image_bytes() -> bytes:
     # Fonts for fixed-size text
     cond_font = get_font(56)
     detail_font = get_font(32)
-    tx_label_font = get_font(30)
-    tx_value_font = get_font(28)
+    tx_label_font = get_font(26)
+    tx_value_font = get_font(24)
     small_font = get_font(20)
 
     margin = 24
     split_x = 420  # left/right column boundary
+    left_col_right = split_x - 10
+    left_inner_width = left_col_right - margin
+    left_mid_split = margin + left_inner_width // 2
 
-    # ===== Fetch data =====
+    # ===== Fetch weather data =====
     try:
         weather_state, w_attrs = ha_state(WEATHER_ENTITY)
     except Exception as e:
@@ -156,6 +226,17 @@ def build_image_bytes() -> bytes:
     cloud_coverage = w_attrs.get("cloud_coverage")
     uv_index = w_attrs.get("uv_index")
 
+    # Optional "feels like" / wind chill
+    wind_chill_value = None
+    for key in ("apparent_temperature", "wind_chill", "windchill", "feels_like", "apparent_temp"):
+        v = w_attrs.get(key)
+        if v not in (None, "unknown", "unavailable"):
+            try:
+                wind_chill_value = float(v)
+                break
+            except Exception:
+                continue
+
     # Transmission
     try:
         dl_state, dl_attrs = ha_state(DL_ENTITY)
@@ -166,7 +247,12 @@ def build_image_bytes() -> bytes:
         dl_text = "ERR"
         ul_text = "ERR"
 
-    # ===== LEFT COLUMN: condition + details + transmission + updated =====
+    # Inside sensors
+    inside_temp_val, inside_temp_unit, _ = numeric_state(INSIDE_TEMP_ENTITY)
+    inside_hum_val, inside_hum_unit, _ = numeric_state(INSIDE_HUMIDITY_ENTITY)
+    hottub_temp_val, hottub_temp_unit, _ = numeric_state(HOTTUB_TEMP_ENTITY)
+
+    # ===== LEFT COLUMN TOP: weather summary =====
     x_left = margin
     y = margin
 
@@ -202,23 +288,120 @@ def build_image_bytes() -> bytes:
     if uv_index is not None:
         add_detail("UV Index", str(uv_index))
 
-    # Transmission block below details
-    y += 16
-    draw.text((x_left, y), "Transmission:", font=tx_label_font, fill=0)
-    y += tx_label_font.size + 6
-    draw.text((x_left, y), f"Up: {ul_text}", font=tx_value_font, fill=0)
-    y += tx_value_font.size + 4
-    draw.text((x_left, y), f"Down: {dl_text}", font=tx_value_font, fill=0)
+    weather_block_bottom = y  # we'll start the inside rows below this
+
+    # ===== LEFT COLUMN MIDDLE: inside temp + hot tub temp =====
+    inside_row_top = max(weather_block_bottom + 12, int(CANVAS_HEIGHT * 0.45))
+    inside_row_bottom = inside_row_top + 90
+    if inside_row_bottom > CANVAS_HEIGHT - 160:
+        inside_row_bottom = CANVAS_HEIGHT - 160
+        inside_row_top = inside_row_bottom - 90
+
+    # Inside temp (left mid)
+    label_font = small_font
+
+    # Inside temp text
+    if inside_temp_val is not None:
+        unit = inside_temp_unit or "°C"
+        inside_temp_text = f"{inside_temp_val:.1f}{unit}"
+    else:
+        inside_temp_text = "—"
+
+    box_inside_left = (margin, inside_row_top, left_mid_split - 5, inside_row_bottom)
+    # label
+    draw.text((box_inside_left[0], box_inside_left[1] + 2), "Inside Temp", font=label_font, fill=0)
+    value_box_inside_left = (
+        box_inside_left[0],
+        box_inside_left[1] + label_font.size + 4,
+        box_inside_left[2],
+        box_inside_left[3] - 4,
+    )
+    font_inside, w_inside, h_inside = fit_text_in_box(
+        draw, inside_temp_text, value_box_inside_left, max_size=70, min_size=32
+    )
+    cx = (value_box_inside_left[0] + value_box_inside_left[2]) // 2
+    cy = (value_box_inside_left[1] + value_box_inside_left[3]) // 2
+    draw.text((cx - w_inside // 2, cy - h_inside // 2), inside_temp_text, font=font_inside, fill=0)
+
+    # Hot tub temp (right mid)
+    if hottub_temp_val is not None:
+        unit = hottub_temp_unit or "°C"
+        hottub_temp_text = f"{hottub_temp_val:.1f}{unit}"
+    else:
+        hottub_temp_text = "—"
+
+    box_hottub = (left_mid_split + 5, inside_row_top, left_col_right, inside_row_bottom)
+    draw.text((box_hottub[0], box_hottub[1] + 2), "Hot Tub Temp", font=label_font, fill=0)
+    value_box_hottub = (
+        box_hottub[0],
+        box_hottub[1] + label_font.size + 4,
+        box_hottub[2],
+        box_hottub[3] - 4,
+    )
+    font_ht, w_ht, h_ht = fit_text_in_box(
+        draw, hottub_temp_text, value_box_hottub, max_size=70, min_size=32
+    )
+    cx_ht = (value_box_hottub[0] + value_box_hottub[2]) // 2
+    cy_ht = (value_box_hottub[1] + value_box_hottub[3]) // 2
+    draw.text((cx_ht - w_ht // 2, cy_ht - h_ht // 2), hottub_temp_text, font=font_ht, fill=0)
+
+    # ===== LEFT COLUMN BOTTOM: inside humidity + transmission =====
+    humidity_row_top = inside_row_bottom + 10
+    humidity_row_bottom = CANVAS_HEIGHT - margin - 45
+    if humidity_row_bottom <= humidity_row_top + 20:
+        humidity_row_top = CANVAS_HEIGHT - 200
+        humidity_row_bottom = CANVAS_HEIGHT - margin - 45
+
+    # Inside humidity (bottom-left)
+    if inside_hum_val is not None:
+        hum_text = f"{inside_hum_val:.0f}%"
+    else:
+        hum_text = "--"
+
+    box_hum = (margin, humidity_row_top, left_mid_split - 5, humidity_row_bottom)
+    draw.text((box_hum[0], box_hum[1] + 2), "Inside Humidity", font=label_font, fill=0)
+    value_box_hum = (
+        box_hum[0],
+        box_hum[1] + label_font.size + 4,
+        box_hum[2],
+        box_hum[3] - 4,
+    )
+    font_hum, w_hum, h_hum = fit_text_in_box(
+        draw, hum_text, value_box_hum, max_size=80, min_size=32
+    )
+    cx_hum = (value_box_hum[0] + value_box_hum[2]) // 2
+    cy_hum = (value_box_hum[1] + value_box_hum[3]) // 2
+    draw.text((cx_hum - w_hum // 2, cy_hum - h_hum // 2), hum_text, font=font_hum, fill=0)
+
+    # Transmission (bottom-right of left column)
+    box_tx = (left_mid_split + 5, humidity_row_top, left_col_right, humidity_row_bottom)
+    tx_cx = (box_tx[0] + box_tx[2]) // 2
+    tx_cy = (box_tx[1] + box_tx[3]) // 2
+
+    # layout three lines vertically centered
+    total_tx_height = tx_label_font.size + tx_value_font.size * 2 + 10
+    start_y = tx_cy - total_tx_height // 2
+
+    draw.text(
+        (box_tx[0], start_y),
+        "Transmission",
+        font=tx_label_font,
+        fill=0,
+    )
+    y_line = start_y + tx_label_font.size + 4
+    draw.text((box_tx[0], y_line), f"Up:   {ul_text}", font=tx_value_font, fill=0)
+    y_line += tx_value_font.size + 2
+    draw.text((box_tx[0], y_line), f"Down: {dl_text}", font=tx_value_font, fill=0)
 
     # Updated timestamp at the very bottom-left
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     updated_text = f"Updated: {now}"
     upd_w, upd_h = text_size(draw, updated_text, small_font)
-    upd_x = x_left
+    upd_x = margin
     upd_y = CANVAS_HEIGHT - margin - upd_h
     draw.text((upd_x, upd_y), updated_text, font=small_font, fill=0)
 
-    # ===== RIGHT COLUMN TOP: huge temperature (dynamically sized) =====
+    # ===== RIGHT COLUMN TOP: huge outside temperature (dynamically sized) =====
     if temp is not None:
         try:
             temp_str = f"{float(temp):.0f}{temp_unit}"
@@ -230,50 +413,51 @@ def build_image_bytes() -> bytes:
     temp_box_left = split_x + 10
     temp_box_top = margin
     temp_box_right = CANVAS_WIDTH - margin
-    temp_box_bottom = CANVAS_HEIGHT // 2 - 10  # top half of the right side
+    temp_box_bottom = CANVAS_HEIGHT // 2 - 20  # top half of the right side
+
+    # Box for main temp text (leave space at bottom for wind chill)
+    temp_text_box = (temp_box_left, temp_box_top, temp_box_right, temp_box_bottom - 30)
 
     temp_font, temp_w, temp_h = fit_text_in_box(
         draw,
         temp_str,
-        (temp_box_left, temp_box_top, temp_box_right, temp_box_bottom),
+        temp_text_box,
         max_size=180,
         min_size=80,
     )
 
-    temp_cx = (temp_box_left + temp_box_right) // 2
-    temp_cy = (temp_box_top + temp_box_bottom) // 2
+    temp_cx = (temp_text_box[0] + temp_text_box[2]) // 2
+    temp_cy = (temp_text_box[1] + temp_text_box[3]) // 2
     temp_x = temp_cx - temp_w // 2
     temp_y = temp_cy - temp_h // 2
     draw.text((temp_x, temp_y), temp_str, font=temp_font, fill=0)
 
-    # ===== RIGHT COLUMN: big weather icon just under temp =====
-    icon = icon_for_condition(condition)
+    # Optional wind chill line under temp
+    if wind_chill_value is not None:
+        try:
+            wc_str = f"[{wind_chill_value:.0f}{temp_unit} wind chill]"
+        except Exception:
+            wc_str = f"[{wind_chill_value} {temp_unit} wind chill]"
+        wc_font = small_font
+        wc_w, wc_h = text_size(draw, wc_str, wc_font)
+        wc_cx = (temp_box_left + temp_box_right) // 2
+        wc_x = wc_cx - wc_w // 2
+        wc_y = temp_box_bottom - wc_h - 4
+        draw.text((wc_x, wc_y), wc_str, font=wc_font, fill=0)
 
-    # Icon box starts a bit below the actual rendered temp glyph, and
-    # stops a bit above the very bottom so it doesn't get clipped.
+    # ===== RIGHT COLUMN BOTTOM: weather icon image (or glyph) =====
     icon_box_left = split_x + 10
-    icon_box_top = temp_y + temp_h + 20
+    icon_box_top = CANVAS_HEIGHT // 2 + 10
     icon_box_right = CANVAS_WIDTH - margin
-    icon_box_bottom = CANVAS_HEIGHT - margin - 40
+    icon_box_bottom = CANVAS_HEIGHT - margin - 10
 
-    # Guard in case temp eats more space than expected
-    if icon_box_bottom <= icon_box_top + 20:
-        icon_box_top = CANVAS_HEIGHT // 2 + 10
-        icon_box_bottom = CANVAS_HEIGHT - margin - 40
-
-    icon_font, icon_w, icon_h = fit_text_in_box(
+    draw_weather_icon(
+        img,
         draw,
-        icon,
         (icon_box_left, icon_box_top, icon_box_right, icon_box_bottom),
-        max_size=260,  # let it get quite large
-        min_size=80,
+        condition,
+        w_attrs,
     )
-
-    icon_cx = (icon_box_left + icon_box_right) // 2
-    icon_cy = (icon_box_top + icon_box_bottom) // 2
-    icon_x = icon_cx - icon_w // 2
-    icon_y = icon_cy - icon_h // 2
-    draw.text((icon_x, icon_y), icon, font=icon_font, fill=0)
 
     # Rotate entire landscape canvas -90° so USB is on the right in widescreen
     rotated = img.rotate(-90, expand=True)
