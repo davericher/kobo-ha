@@ -33,7 +33,6 @@ const HA_HEADERS = {
 // ===== Helpers =====
 
 function fontSpec(size) {
-  // DejaVu Sans is installed in the Dockerfile
   return `${size}px "DejaVu Sans"`;
 }
 
@@ -55,9 +54,7 @@ function textSize(ctx, text) {
 async function haState(entityId) {
   const url = `${HA_URL}/api/states/${entityId}`;
   const res = await fetch(url, { headers: HA_HEADERS });
-  if (!res.ok) {
-    throw new Error(`HA ${entityId} HTTP ${res.status}`);
-  }
+  if (!res.ok) throw new Error(`HA ${entityId} HTTP ${res.status}`);
   const data = await res.json();
   return [data.state, data.attributes || {}];
 }
@@ -93,9 +90,7 @@ function formatSpeed(state, attrs) {
   if (state === "unknown" || state === "unavailable" || state == null) return "-";
   const unit = attrs?.unit_of_measurement || "";
   const n = parseFloat(state);
-  if (!Number.isNaN(n)) {
-    return `${n.toFixed(1)} ${unit}`.trim();
-  }
+  if (!Number.isNaN(n)) return `${n.toFixed(1)} ${unit}`.trim();
   return `${state} ${unit}`.trim();
 }
 
@@ -123,20 +118,32 @@ function fitTextInBox(ctx, text, box, maxSize, minSize) {
 
 async function numericState(entityId) {
   if (!entityId) return [null, null, {}];
-
   try {
     const [state, attrs] = await haState(entityId);
     if (state === "unknown" || state === "unavailable" || state == null) {
       return [null, attrs.unit_of_measurement, attrs];
     }
-    const value = parseFloat(state);
-    if (Number.isNaN(value)) {
-      return [null, attrs.unit_of_measurement, attrs];
-    }
-    return [value, attrs.unit_of_measurement, attrs];
+    const v = parseFloat(state);
+    if (Number.isNaN(v)) return [null, attrs.unit_of_measurement, attrs];
+    return [v, attrs.unit_of_measurement, attrs];
   } catch {
     return [null, null, {}];
   }
+}
+
+function underline(ctx, text, x, y, fontSize) {
+  // x,y = top-left of the text (with baseline "top")
+  ctx.save();
+  ctx.font = fontSpec(fontSize);
+  const { w } = textSize(ctx, text);
+  const underlineY = y + fontSize + 2;
+  ctx.beginPath();
+  ctx.moveTo(x, underlineY);
+  ctx.lineTo(x + w, underlineY);
+  ctx.strokeStyle = "#000000";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.restore();
 }
 
 async function drawWeatherIcon(ctx, box, condition, wAttrs) {
@@ -144,15 +151,12 @@ async function drawWeatherIcon(ctx, box, condition, wAttrs) {
   const boxW = Math.max(1, right - left);
   const boxH = Math.max(1, bottom - top);
 
+  // Try HA entity_picture first
   let iconUrl = wAttrs?.entity_picture;
   if (iconUrl && typeof iconUrl === "string") {
-    if (iconUrl.startsWith("/")) {
-      iconUrl = `${HA_URL}${iconUrl}`;
-    }
+    if (iconUrl.startsWith("/")) iconUrl = `${HA_URL}${iconUrl}`;
     try {
-      const img = await loadImage(iconUrl, {
-        headers: HA_HEADERS,
-      });
+      const img = await loadImage(iconUrl, { headers: HA_HEADERS });
       const iw = img.width || 1;
       const ih = img.height || 1;
       const scale = Math.min(boxW / iw, boxH / ih, 1);
@@ -163,42 +167,48 @@ async function drawWeatherIcon(ctx, box, condition, wAttrs) {
       ctx.drawImage(img, dx, dy, drawW, drawH);
       return;
     } catch {
-      // fall through to glyph
+      // fall back to glyph
     }
   }
 
-  // Fallback: big unicode glyph
+  // Fallback: glyph perfectly centered in box
   const glyph = iconForCondition(condition);
-  const { font, w, h } = fitTextInBox(ctx, glyph, box, 260, 80);
-  ctx.save();
-  ctx.font = font;
-  ctx.textBaseline = "top";
-  ctx.textAlign = "left";
+  const maxSize = Math.min(boxH - 10, 260);
+  let chosenSize = 80;
 
-  const cx = (left + right) / 2;
-  const cy = (top + bottom) / 2;
-  const x = cx - w / 2;
-  const y = cy - h / 2;
-  ctx.fillText(glyph, x, y);
+  for (let size = maxSize; size >= 80; size -= 2) {
+    ctx.save();
+    ctx.font = fontSpec(size);
+    const { w } = textSize(ctx, glyph);
+    ctx.restore();
+    if (w <= boxW - 10) {
+      chosenSize = size;
+      break;
+    }
+  }
+
+  ctx.save();
+  ctx.font = fontSpec(chosenSize);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(glyph, (left + right) / 2, (top + bottom) / 2);
   ctx.restore();
 }
 
-// Rotate landscape -> portrait (600x800), USB on the right like before
+// Rotate landscape -> portrait (600x800), USB on the right
 function rotateToPortrait(canvas) {
   const rotated = new Canvas(600, 800, { gpu: false });
   const rctx = rotated.getContext("2d");
   rctx.fillStyle = "#ffffff";
   rctx.fillRect(0, 0, rotated.width, rotated.height);
 
-  // rotate -90° so USB is on the right
   rctx.translate(0, rotated.height);
   rctx.rotate(-Math.PI / 2);
   rctx.drawImage(canvas, 0, 0);
-
   return rotated;
 }
 
-// ===== Main LANDSCAPE renderer (shared by RAW + PNG) =====
+// ===== Main LANDSCAPE renderer =====
 async function buildLandscapeCanvas() {
   const canvas = new Canvas(CANVAS_WIDTH, CANVAS_HEIGHT, { gpu: false });
   const ctx = canvas.getContext("2d");
@@ -209,7 +219,6 @@ async function buildLandscapeCanvas() {
   ctx.textBaseline = "top";
   ctx.textAlign = "left";
 
-  // Font sizes (mirror Python)
   const COND_SIZE = 56;
   const DETAIL_SIZE = 32;
   const TX_LABEL_SIZE = 26;
@@ -217,7 +226,7 @@ async function buildLandscapeCanvas() {
   const SMALL_SIZE = 20;
 
   const margin = 24;
-  const splitX = 420; // left/right column boundary
+  const splitX = 420;
   const leftColRight = splitX - 10;
   const leftInnerWidth = leftColRight - margin;
   const leftMidSplit = margin + Math.floor(leftInnerWidth / 2);
@@ -247,7 +256,6 @@ async function buildLandscapeCanvas() {
   const cloudCoverage = wAttrs.cloud_coverage;
   const uvIndex = wAttrs.uv_index;
 
-  // Optional "feels like" / wind chill
   let windChillValue = null;
   for (const key of [
     "apparent_temperature",
@@ -302,19 +310,14 @@ async function buildLandscapeCanvas() {
 
   if (humidity != null) addDetail("Humidity", `${humidity}%`);
   if (pressure != null) addDetail("Pressure", `${pressure} hPa`);
-
   if (windSpeed != null) {
-    let wsStr;
     const n = parseFloat(windSpeed);
-    if (!Number.isNaN(n)) {
-      wsStr = `${n.toFixed(1)} ${windSpeedUnit}`;
-    } else {
-      wsStr = `${windSpeed} ${windSpeedUnit}`;
-    }
+    const wsStr = !Number.isNaN(n)
+      ? `${n.toFixed(1)} ${windSpeedUnit}`
+      : `${windSpeed} ${windSpeedUnit}`;
     const bearing = windBearing ? ` (${windBearing})` : "";
     addDetail("Wind", `${wsStr}${bearing}`);
   }
-
   if (cloudCoverage != null) addDetail("Clouds", `${cloudCoverage}%`);
   if (uvIndex != null) addDetail("UV Index", String(uvIndex));
 
@@ -331,7 +334,8 @@ async function buildLandscapeCanvas() {
     insideRowTop = insideRowBottom - 90;
   }
 
-  const LABEL_FONT = fontSpec(SMALL_SIZE);
+  const LABEL_SIZE = SMALL_SIZE;
+  const LABEL_FONT = fontSpec(LABEL_SIZE);
 
   // Inside temp (left mid)
   let insideTempText = "—";
@@ -342,11 +346,14 @@ async function buildLandscapeCanvas() {
 
   const boxInsideLeft = [margin, insideRowTop, leftMidSplit - 5, insideRowBottom];
   ctx.font = LABEL_FONT;
-  ctx.fillText("Inside Temp", boxInsideLeft[0], boxInsideLeft[1] + 2);
+  const insideTempLabelX = boxInsideLeft[0];
+  const insideTempLabelY = boxInsideLeft[1] + 2;
+  ctx.fillText("Inside Temp", insideTempLabelX, insideTempLabelY);
+  underline(ctx, "Inside Temp", insideTempLabelX, insideTempLabelY, LABEL_SIZE);
 
   const valueBoxInsideLeft = [
     boxInsideLeft[0],
-    boxInsideLeft[1] + SMALL_SIZE + 4,
+    boxInsideLeft[1] + LABEL_SIZE + 6,
     boxInsideLeft[2],
     boxInsideLeft[3] - 4,
   ];
@@ -373,11 +380,14 @@ async function buildLandscapeCanvas() {
 
   const boxHottub = [leftMidSplit + 5, insideRowTop, leftColRight, insideRowBottom];
   ctx.font = LABEL_FONT;
-  ctx.fillText("Hot Tub Temp", boxHottub[0], boxHottub[1] + 2);
+  const hotTubLabelX = boxHottub[0];
+  const hotTubLabelY = boxHottub[1] + 2;
+  ctx.fillText("Hot Tub Temp", hotTubLabelX, hotTubLabelY);
+  underline(ctx, "Hot Tub Temp", hotTubLabelX, hotTubLabelY, LABEL_SIZE);
 
   const valueBoxHottub = [
     boxHottub[0],
-    boxHottub[1] + SMALL_SIZE + 4,
+    boxHottub[1] + LABEL_SIZE + 6,
     boxHottub[2],
     boxHottub[3] - 4,
   ];
@@ -405,17 +415,18 @@ async function buildLandscapeCanvas() {
 
   // Inside humidity (bottom-left)
   let humText = "--";
-  if (insideHumVal != null) {
-    humText = `${insideHumVal.toFixed(0)}%`;
-  }
+  if (insideHumVal != null) humText = `${insideHumVal.toFixed(0)}%`;
 
   const boxHum = [margin, humidityRowTop, leftMidSplit - 5, humidityRowBottom];
   ctx.font = LABEL_FONT;
-  ctx.fillText("Inside Humidity", boxHum[0], boxHum[1] + 2);
+  const humLabelX = boxHum[0];
+  const humLabelY = boxHum[1] + 2;
+  ctx.fillText("Inside Humidity", humLabelX, humLabelY);
+  underline(ctx, "Inside Humidity", humLabelX, humLabelY, LABEL_SIZE);
 
   const valueBoxHum = [
     boxHum[0],
-    boxHum[1] + SMALL_SIZE + 4,
+    boxHum[1] + LABEL_SIZE + 6,
     boxHum[2],
     boxHum[3] - 4,
   ];
@@ -435,7 +446,10 @@ async function buildLandscapeCanvas() {
   let startY = txCy - totalTxHeight / 2;
 
   ctx.font = fontSpec(TX_LABEL_SIZE);
-  ctx.fillText("Transmission", boxTx[0], startY);
+  const txLabelX = boxTx[0];
+  const txLabelY = startY;
+  ctx.fillText("Transmission", txLabelX, txLabelY);
+  underline(ctx, "Transmission", txLabelX, txLabelY, TX_LABEL_SIZE);
 
   startY += TX_LABEL_SIZE + 4;
   ctx.font = fontSpec(TX_VALUE_SIZE);
@@ -457,11 +471,7 @@ async function buildLandscapeCanvas() {
   let tempStr = "—";
   if (temp != null) {
     const n = parseFloat(temp);
-    if (!Number.isNaN(n)) {
-      tempStr = `${n.toFixed(0)}${tempUnit}`;
-    } else {
-      tempStr = `${temp}${tempUnit}`;
-    }
+    tempStr = !Number.isNaN(n) ? `${n.toFixed(0)}${tempUnit}` : `${temp}${tempUnit}`;
   }
 
   const tempBoxLeft = splitX + 10;
@@ -475,19 +485,14 @@ async function buildLandscapeCanvas() {
     ctx.font = font;
     const cx = (tempTextBox[0] + tempTextBox[2]) / 2;
     const cy = (tempTextBox[1] + tempTextBox[3]) / 2;
-    const x = cx - w / 2;
-    const yMid = cy - h / 2;
-    ctx.fillText(tempStr, x, yMid);
+    ctx.fillText(tempStr, cx - w / 2, cy - h / 2);
   }
 
   if (windChillValue != null) {
-    let wcStr;
     const n = parseFloat(windChillValue);
-    if (!Number.isNaN(n)) {
-      wcStr = `[${n.toFixed(0)}${tempUnit} wind chill]`;
-    } else {
-      wcStr = `[${windChillValue} ${tempUnit} wind chill]`;
-    }
+    const wcStr = !Number.isNaN(n)
+      ? `[${n.toFixed(0)}${tempUnit} wind chill]`
+      : `[${windChillValue} ${tempUnit} wind chill]`;
     ctx.font = fontSpec(SMALL_SIZE);
     const { w: wcW, h: wcH } = textSize(ctx, wcStr);
     const wcCx = (tempBoxLeft + tempBoxRight) / 2;
@@ -496,7 +501,7 @@ async function buildLandscapeCanvas() {
     ctx.fillText(wcStr, wcX, wcY);
   }
 
-  // ===== RIGHT COLUMN BOTTOM: weather icon image (or glyph) =====
+  // ===== RIGHT COLUMN BOTTOM: weather icon (centered in its quadrant) =====
   const iconBoxLeft = splitX + 10;
   const iconBoxTop = CANVAS_HEIGHT / 2 + 10;
   const iconBoxRight = CANVAS_WIDTH - margin;
@@ -508,6 +513,42 @@ async function buildLandscapeCanvas() {
     condition,
     wAttrs
   );
+
+  // ===== GRID LINES (4 quadrants + inner 4 in bottom-left) =====
+  ctx.save();
+  ctx.strokeStyle = "#000000";
+  ctx.lineWidth = 1;
+
+  // Outer border
+  ctx.strokeRect(margin, margin, CANVAS_WIDTH - 2 * margin, CANVAS_HEIGHT - 2 * margin);
+
+  const midY = CANVAS_HEIGHT / 2;
+
+  // Vertical split (left/right)
+  ctx.beginPath();
+  ctx.moveTo(splitX, margin);
+  ctx.lineTo(splitX, CANVAS_HEIGHT - margin);
+  ctx.stroke();
+
+  // Horizontal split (top/bottom)
+  ctx.beginPath();
+  ctx.moveTo(margin, midY);
+  ctx.lineTo(CANVAS_WIDTH - margin, midY);
+  ctx.stroke();
+
+  // Bottom-left inner vertical (between Inside/HotTub, Humidity/Transmission)
+  ctx.beginPath();
+  ctx.moveTo(leftMidSplit, midY);
+  ctx.lineTo(leftMidSplit, CANVAS_HEIGHT - margin);
+  ctx.stroke();
+
+  // Bottom-left inner horizontal (between top & bottom rows)
+  ctx.beginPath();
+  ctx.moveTo(margin, insideRowBottom);
+  ctx.lineTo(leftColRight, insideRowBottom);
+  ctx.stroke();
+
+  ctx.restore();
 
   return canvas;
 }
