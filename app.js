@@ -7,19 +7,41 @@ import { Canvas, loadImage } from "skia-canvas";
 
 // ===== Config via environment variables =====
 const HA_URL = (process.env.HA_URL || "http://homeassistant:8123").replace(/\/+$/, "");
+
 const HA_TOKEN = process.env.HA_TOKEN || "";
 
-const WEATHER_ENTITY = process.env.WEATHER_ENTITY || "weather.ironynet";
+const WEATHER_ENTITY = process.env.WEATHER_ENTITY || "weather.provider";
+
 const DL_ENTITY = process.env.DL_ENTITY || "sensor.transmission_download_speed";
+
 const UL_ENTITY = process.env.UL_ENTITY || "sensor.transmission_upload_speed";
 
 // Inside sensors
 const INSIDE_TEMP_ENTITY = process.env.INSIDE_TEMP_ENTITY || "";
+
 const INSIDE_HUMIDITY_ENTITY = process.env.INSIDE_HUMIDITY_ENTITY || "";
+
 const HOTTUB_TEMP_ENTITY = process.env.HOTTUB_TEMP_ENTITY || "";
 
+// New “location” / counts
+const LIGHTS_ON_ENTITY = process.env.LIGHTS_ON_ENTITY || "";
+
+const FANS_ON_ENTITY = process.env.FANS_ON_ENTITY || "";
+
+const TORRENTS_ENTITY =
+  process.env.TORRENTS_ENTITY || "sensor.transmission_total_torrents";
+
+  const PERSON_DAVE_ENTITY =
+  process.env.PERSON_DAVE_ENTITY || "person.dave";
+
+  const PERSON_KAYLA_ENTITY =
+  process.env.PERSON_KAYLA_ENTITY || "person.kayla";
+
+
+// Bind Host/Port
 const BIND_HOST = process.env.BIND_HOST || "0.0.0.0";
 const BIND_PORT = parseInt(process.env.BIND_PORT || "8080", 10);
+
 
 // Logical canvas in LANDSCAPE. We’ll rotate it at the end to 600x800 portrait.
 const CANVAS_WIDTH = 800;
@@ -131,6 +153,59 @@ async function numericState(entityId) {
   }
 }
 
+async function stringState(entityId) {
+  if (!entityId) return [null, {}];
+  try {
+    const [state, attrs] = await haState(entityId);
+    if (state === "unknown" || state === "unavailable" || state == null) {
+      return [null, attrs];
+    }
+    return [String(state), attrs];
+  } catch {
+    return [null, {}];
+  }
+}
+
+function titleCase(str) {
+  return String(str || "")
+    .replace(/_/g, " ")
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((s) => s.charAt(0).toUpperCase() + s.slice(1).toLowerCase())
+    .join(" ");
+}
+
+function formatPersonLocation(state) {
+  if (!state) return "—";
+  if (state === "home") return "Home";
+  if (state === "not_home") return "Away";
+  return titleCase(state);
+}
+
+function formatOnOff(state) {
+  if (!state) return "—";
+  const s = String(state).toLowerCase();
+  if (s === "on" || s === "true") return "On";
+  if (s === "off" || s === "false") return "Off";
+  return titleCase(state);
+}
+
+function ordinalSuffix(n) {
+  const v = n % 100;
+  if (v >= 11 && v <= 13) return "th";
+  switch (v % 10) {
+    case 1:
+      return "st";
+    case 2:
+      return "nd";
+    case 3:
+      return "rd";
+    default:
+      return "th";
+  }
+}
+
+
 function underline(ctx, text, x, y, fontSize) {
   // x,y = top-left of the text (with baseline "top")
   ctx.save();
@@ -197,7 +272,7 @@ async function drawWeatherIcon(ctx, box, condition, wAttrs) {
 
 // Rotate landscape -> portrait (600x800), USB on the right
 function rotateToPortrait(canvas) {
-  const rotated = new Canvas(600, 800, { gpu: false });
+  const rotated = new Canvas(600, 800, { gpu: true });
   const rctx = rotated.getContext("2d");
   rctx.fillStyle = "#ffffff";
   rctx.fillRect(0, 0, rotated.width, rotated.height);
@@ -209,37 +284,53 @@ function rotateToPortrait(canvas) {
 }
 
 // ===== Main LANDSCAPE renderer =====
+// ===== Main LANDSCAPE renderer =====
 async function buildLandscapeCanvas() {
   const canvas = new Canvas(CANVAS_WIDTH, CANVAS_HEIGHT, { gpu: false });
   const ctx = canvas.getContext("2d");
 
+  // White background
   ctx.fillStyle = "#ffffff";
   ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-  ctx.fillStyle = "#000000";
+
+  ctx.fillStyle = "#000000"; // darkest possible for text
   ctx.textBaseline = "top";
   ctx.textAlign = "left";
 
-  const COND_SIZE = 56;
-  const DETAIL_SIZE = 32;
-  const TX_LABEL_SIZE = 26;
-  const TX_VALUE_SIZE = 24;
-  const SMALL_SIZE = 20;
+  const now = new Date();
 
-  const margin = 24;
-  const splitX = 420;
-  const leftColRight = splitX - 10;
-  const leftInnerWidth = leftColRight - margin;
-  const leftMidSplit = margin + Math.floor(leftInnerWidth / 2);
+  const COND_MAX_SIZE = 56;
+  const DETAIL_MAX_SIZE = 28;
+  const LABEL_MIN_SIZE = 14;
+  const SMALL_SIZE = 18;
+  const TIME_FONT_SIZE = 10;
+  const HEADER_LABEL_SIZE = 20
+
+  const margin = 12;
+  const contentLeft = margin;
+  const contentRight = CANVAS_WIDTH - margin;
+  const contentTop = margin;
+  const contentBottom = CANVAS_HEIGHT - margin;
+
+  // Major splits (4 quadrants like the sketch)
+  const splitX = 420; // left/right
+  const midY = CANVAS_HEIGHT / 2; // top/bottom
+
+  const leftColWidth = splitX - contentLeft;
+  const leftMidX = contentLeft + leftColWidth / 2;
+
+  const bottomHeight = contentBottom - midY;
+  const bottomMidY = midY + bottomHeight / 2;
 
   // ===== Fetch weather data =====
   let weatherState, wAttrs;
   try {
     [weatherState, wAttrs] = await haState(WEATHER_ENTITY);
   } catch (e) {
-    ctx.font = fontSpec(DETAIL_SIZE);
+    ctx.font = fontSpec(DETAIL_MAX_SIZE);
     ctx.fillText("Error reading weather", margin, margin);
     ctx.font = fontSpec(SMALL_SIZE);
-    ctx.fillText(String(e), margin, margin + DETAIL_SIZE + 4);
+    ctx.fillText(String(e), margin, margin + DETAIL_MAX_SIZE + 4);
     return canvas;
   }
 
@@ -247,14 +338,16 @@ async function buildLandscapeCanvas() {
   const temp = wAttrs.temperature;
   const tempUnit = wAttrs.temperature_unit || "°C";
 
-  const humidity = wAttrs.humidity;
+  const humidityOut = wAttrs.humidity;
   const pressure = wAttrs.pressure;
+  const cloudCoverage =
+    wAttrs.cloud_coverage ?? wAttrs.cloudiness ?? wAttrs.clouds;
+  const uvIndex = wAttrs.uv_index;
+
   const windSpeed = wAttrs.wind_speed ?? wAttrs.native_wind_speed;
   const windSpeedUnit =
     wAttrs.wind_speed_unit ?? wAttrs.native_wind_speed_unit ?? "m/s";
   const windBearing = wAttrs.wind_bearing;
-  const cloudCoverage = wAttrs.cloud_coverage;
-  const uvIndex = wAttrs.uv_index;
 
   let windChillValue = null;
   for (const key of [
@@ -274,284 +367,649 @@ async function buildLandscapeCanvas() {
     }
   }
 
-  // Transmission
-  let dlText = "ERR";
-  let ulText = "ERR";
+  // Transmission (download / upload)
+  let dlText = "—";
+  let ulText = "—";
   try {
     const [dlState, dlAttrs] = await haState(DL_ENTITY);
     const [ulState, ulAttrs] = await haState(UL_ENTITY);
     dlText = formatSpeed(dlState, dlAttrs);
     ulText = formatSpeed(ulState, ulAttrs);
   } catch {
-    // keep ERR
+    dlText = "ERR";
+    ulText = "ERR";
   }
 
   // Inside sensors
-  const [insideTempVal, insideTempUnit] = await numericState(INSIDE_TEMP_ENTITY);
+  const [insideTempVal, insideTempUnit] = await numericState(
+    INSIDE_TEMP_ENTITY
+  );
   const [insideHumVal] = await numericState(INSIDE_HUMIDITY_ENTITY);
-  const [hottubTempVal, hottubTempUnit] = await numericState(HOTTUB_TEMP_ENTITY);
+  const [hottubTempVal, hottubTempUnit] = await numericState(
+    HOTTUB_TEMP_ENTITY
+  );
 
-  // ===== LEFT COLUMN TOP: weather summary =====
-  let xLeft = margin;
-  let y = margin;
+  // Location / counts sensors
+  const [lightsOnVal] = await numericState(LIGHTS_ON_ENTITY);
+  const [fansOnVal] = await numericState(FANS_ON_ENTITY);
+  const [torrentCount] = await numericState(TORRENTS_ENTITY);
+  const [daveRaw] = await stringState(PERSON_DAVE_ENTITY);
+  const [kaylaRaw] = await stringState(PERSON_KAYLA_ENTITY);
 
-  ctx.font = fontSpec(COND_SIZE);
+  const daveLoc = formatPersonLocation(daveRaw);
+  const kaylaLoc = formatPersonLocation(kaylaRaw);
+  const lightsText =
+    lightsOnVal != null ? String(Math.round(lightsOnVal)) : "—";
+  const fansText = fansOnVal != null ? String(Math.round(fansOnVal)) : "—";
+  const torrentsText =
+    torrentCount != null ? String(Math.round(torrentCount)) : "—";
+
+  // ===== TOP-LEFT: Weather summary block =====
+  const weatherLeft = contentLeft;
+  const weatherTop = contentTop;
+  const weatherRight = splitX;
+  const weatherBottom = midY;
+
+  // Condition line ("Cloudy")
+  const condBox = [
+    weatherLeft + 6,
+    weatherTop + 4,
+    weatherRight - 6,
+    weatherTop + 60,
+  ];
   const condText =
     (condition || "").charAt(0).toUpperCase() + (condition || "").slice(1);
-  ctx.fillText(condText, xLeft, y);
-  y += COND_SIZE + 16;
-
-  function addDetail(label, value) {
-    ctx.font = fontSpec(DETAIL_SIZE);
-    const text = `${label}: ${value}`;
-    ctx.fillText(text, xLeft, y);
-    y += DETAIL_SIZE + 8;
-  }
-
-  if (humidity != null) addDetail("Humidity", `${humidity}%`);
-  if (pressure != null) addDetail("Pressure", `${pressure} hPa`);
-  if (windSpeed != null) {
-    const n = parseFloat(windSpeed);
-    const wsStr = !Number.isNaN(n)
-      ? `${n.toFixed(1)} ${windSpeedUnit}`
-      : `${windSpeed} ${windSpeedUnit}`;
-    const bearing = windBearing ? ` (${windBearing})` : "";
-    addDetail("Wind", `${wsStr}${bearing}`);
-  }
-  if (cloudCoverage != null) addDetail("Clouds", `${cloudCoverage}%`);
-  if (uvIndex != null) addDetail("UV Index", String(uvIndex));
-
-  const weatherBlockBottom = y;
-
-  // ===== LEFT COLUMN MIDDLE: inside temp + hot tub temp =====
-  let insideRowTop = Math.max(
-    weatherBlockBottom + 12,
-    Math.floor(CANVAS_HEIGHT * 0.45)
-  );
-  let insideRowBottom = insideRowTop + 90;
-  if (insideRowBottom > CANVAS_HEIGHT - 160) {
-    insideRowBottom = CANVAS_HEIGHT - 160;
-    insideRowTop = insideRowBottom - 90;
-  }
-
-  const LABEL_SIZE = SMALL_SIZE;
-  const LABEL_FONT = fontSpec(LABEL_SIZE);
-
-  // Inside temp (left mid)
-  let insideTempText = "—";
-  if (insideTempVal != null) {
-    const unit = insideTempUnit || "°C";
-    insideTempText = `${insideTempVal.toFixed(1)}${unit}`;
-  }
-
-  const boxInsideLeft = [margin, insideRowTop, leftMidSplit - 5, insideRowBottom];
-  ctx.font = LABEL_FONT;
-  const insideTempLabelX = boxInsideLeft[0];
-  const insideTempLabelY = boxInsideLeft[1] + 2;
-  ctx.fillText("Inside Temp", insideTempLabelX, insideTempLabelY);
-  underline(ctx, "Inside Temp", insideTempLabelX, insideTempLabelY, LABEL_SIZE);
-
-  const valueBoxInsideLeft = [
-    boxInsideLeft[0],
-    boxInsideLeft[1] + LABEL_SIZE + 6,
-    boxInsideLeft[2],
-    boxInsideLeft[3] - 4,
-  ];
   {
     const { font, w, h } = fitTextInBox(
       ctx,
-      insideTempText,
-      valueBoxInsideLeft,
-      70,
-      32
+      condText,
+      condBox,
+      COND_MAX_SIZE,
+      LABEL_MIN_SIZE
     );
     ctx.font = font;
-    const cx = (valueBoxInsideLeft[0] + valueBoxInsideLeft[2]) / 2;
-    const cy = (valueBoxInsideLeft[1] + valueBoxInsideLeft[3]) / 2;
-    ctx.fillText(insideTempText, cx - w / 2, cy - h / 2);
+    const cx = (condBox[0] + condBox[2]) / 2;
+    const cy = (condBox[1] + condBox[3]) / 2;
+    ctx.fillText(condText, cx - w / 2, cy - h / 2);
   }
 
-  // Hot tub temp (right mid)
-  let hottubTempText = "—";
-  if (hottubTempVal != null) {
-    const unit = hottubTempUnit || "°C";
-    hottubTempText = `${hottubTempVal.toFixed(1)}${unit}`;
-  }
+  // Detail rows (Humidity, Pressure, Wind, Clouds, UV, Transmission)
+  const detailStartY = condBox[3] + 6;
+  const detailBottom = weatherBottom - 6;
+  const detailRowsCount = 6;
+  const detailRowHeight = (detailBottom - detailStartY) / detailRowsCount;
 
-  const boxHottub = [leftMidSplit + 5, insideRowTop, leftColRight, insideRowBottom];
-  ctx.font = LABEL_FONT;
-  const hotTubLabelX = boxHottub[0];
-  const hotTubLabelY = boxHottub[1] + 2;
-  ctx.fillText("Hot Tub Temp", hotTubLabelX, hotTubLabelY);
-  underline(ctx, "Hot Tub Temp", hotTubLabelX, hotTubLabelY, LABEL_SIZE);
+  const detailTexts = (() => {
+    const humStr =
+      humidityOut != null ? `${humidityOut}%` : "\u2014"; // —
+    const presStr =
+      pressure != null ? `${pressure} hPa` : "\u2014";
+    let windStr = "—";
+    if (windSpeed != null) {
+      const n = parseFloat(windSpeed);
+      const speed = !Number.isNaN(n)
+        ? `${n.toFixed(1)} ${windSpeedUnit}`
+        : `${windSpeed} ${windSpeedUnit}`;
+      const bearing = windBearing ? ` ${windBearing}` : "";
+      windStr = `${speed}${bearing}`.trim();
+    }
+    const cloudStr =
+      cloudCoverage != null ? `${cloudCoverage}%` : "\u2014";
+    const uvStr = uvIndex != null ? String(uvIndex) : "\u2014";
+    const txStr = `Up: ${ulText}   Down: ${dlText}`;
+    return [
+      `Humidity: ${humStr}`,
+      `Pressure: ${presStr}`,
+      `Wind: ${windStr}`,
+      `Clouds: ${cloudStr}`,
+      `UV Index: ${uvStr}`,
+      `Transmission: ${txStr}`,
+    ];
+  })();
 
-  const valueBoxHottub = [
-    boxHottub[0],
-    boxHottub[1] + LABEL_SIZE + 6,
-    boxHottub[2],
-    boxHottub[3] - 4,
-  ];
-  {
+  const detailRowBounds = [];
+
+  for (let i = 0; i < detailRowsCount; i++) {
+    const rowTop = detailStartY + i * detailRowHeight;
+    const rowBottom =
+      i === detailRowsCount - 1 ? detailBottom : rowTop + detailRowHeight;
+    detailRowBounds.push({ top: rowTop, bottom: rowBottom });
+
+    const box = [weatherLeft + 8, rowTop + 2, weatherRight - 8, rowBottom - 2];
+    const text = detailTexts[i] || "";
     const { font, w, h } = fitTextInBox(
       ctx,
-      hottubTempText,
-      valueBoxHottub,
-      70,
-      32
+      text,
+      box,
+      DETAIL_MAX_SIZE,
+      LABEL_MIN_SIZE
     );
     ctx.font = font;
-    const cx = (valueBoxHottub[0] + valueBoxHottub[2]) / 2;
-    const cy = (valueBoxHottub[1] + valueBoxHottub[3]) / 2;
-    ctx.fillText(hottubTempText, cx - w / 2, cy - h / 2);
+    const y = rowTop + (rowBottom - rowTop - h) / 2;
+    ctx.fillText(text, box[0], y);
   }
 
-  // ===== LEFT COLUMN BOTTOM: inside humidity + transmission =====
-  let humidityRowTop = insideRowBottom + 10;
-  let humidityRowBottom = CANVAS_HEIGHT - margin - 45;
-  if (humidityRowBottom <= humidityRowTop + 20) {
-    humidityRowTop = CANVAS_HEIGHT - 200;
-    humidityRowBottom = CANVAS_HEIGHT - margin - 45;
-  }
+  // ===== TOP-RIGHT: Outside temp block =====
+  const outLeft = splitX;
+  const outTop = contentTop;
+  const outRight = contentRight;
+  const outBottom = midY;
 
-  // Inside humidity (bottom-left)
-  let humText = "--";
-  if (insideHumVal != null) humText = `${insideHumVal.toFixed(0)}%`;
-
-  const boxHum = [margin, humidityRowTop, leftMidSplit - 5, humidityRowBottom];
-  ctx.font = LABEL_FONT;
-  const humLabelX = boxHum[0];
-  const humLabelY = boxHum[1] + 2;
-  ctx.fillText("Inside Humidity", humLabelX, humLabelY);
-  underline(ctx, "Inside Humidity", humLabelX, humLabelY, LABEL_SIZE);
-
-  const valueBoxHum = [
-    boxHum[0],
-    boxHum[1] + LABEL_SIZE + 6,
-    boxHum[2],
-    boxHum[3] - 4,
+  // Header: "OUTSIDE TEMP"
+  const outsideHeaderBox = [
+    outLeft + 8,
+    outTop + 4,
+    outRight - 8,
+    outTop + 40,
   ];
   {
-    const { font, w, h } = fitTextInBox(ctx, humText, valueBoxHum, 80, 32);
+    const headerText = "OUTSIDE TEMP";
+    const { font, w, h } = fitTextInBox(
+      ctx,
+      headerText,
+      outsideHeaderBox,
+      28,
+      16
+    );
     ctx.font = font;
-    const cx = (valueBoxHum[0] + valueBoxHum[2]) / 2;
-    const cy = (valueBoxHum[1] + valueBoxHum[3]) / 2;
-    ctx.fillText(humText, cx - w / 2, cy - h / 2);
+    const cx = (outsideHeaderBox[0] + outsideHeaderBox[2]) / 2;
+    const cy = (outsideHeaderBox[1] + outsideHeaderBox[3]) / 2;
+    ctx.fillText(headerText, cx - w / 2, cy - h / 2);
   }
 
-  // Transmission (bottom-right of left column)
-  const boxTx = [leftMidSplit + 5, humidityRowTop, leftColRight, humidityRowBottom];
-  const txCx = (boxTx[0] + boxTx[2]) / 2;
-  const txCy = (boxTx[1] + boxTx[3]) / 2;
-  const totalTxHeight = TX_LABEL_SIZE + TX_VALUE_SIZE * 2 + 10;
-  let startY = txCy - totalTxHeight / 2;
-
-  ctx.font = fontSpec(TX_LABEL_SIZE);
-  const txLabelX = boxTx[0];
-  const txLabelY = startY;
-  ctx.fillText("Transmission", txLabelX, txLabelY);
-  underline(ctx, "Transmission", txLabelX, txLabelY, TX_LABEL_SIZE);
-
-  startY += TX_LABEL_SIZE + 4;
-  ctx.font = fontSpec(TX_VALUE_SIZE);
-  ctx.fillText(`Up:   ${ulText}`, boxTx[0], startY);
-
-  startY += TX_VALUE_SIZE + 2;
-  ctx.fillText(`Down: ${dlText}`, boxTx[0], startY);
-
-  // Updated timestamp bottom-left
-  const now = new Date();
-  const updatedText = `Updated: ${now.toISOString().slice(0, 16).replace("T", " ")}`;
-  ctx.font = fontSpec(SMALL_SIZE);
-  const { h: updH } = textSize(ctx, updatedText);
-  const updX = CANVAS_WIDTH / 2 + margin;
-  const updY = CANVAS_HEIGHT - margin - updH;
-  ctx.fillText(updatedText, updX, updY);
-
-  // ===== RIGHT COLUMN TOP: outside temp and optional wind chill =====
-  let tempStr = "—";
+  // Big outside temp value
+  let tempStr = "\u2014"; // —
   if (temp != null) {
     const n = parseFloat(temp);
     tempStr = !Number.isNaN(n) ? `${n.toFixed(0)}${tempUnit}` : `${temp}${tempUnit}`;
   }
 
-  const tempBoxLeft = splitX + 10;
-  const tempBoxTop = margin;
-  const tempBoxRight = CANVAS_WIDTH - margin;
-  const tempBoxBottom = CANVAS_HEIGHT / 2 - 20;
-  const tempTextBox = [tempBoxLeft, tempBoxTop, tempBoxRight, tempBoxBottom - 30];
-
+  const tempValueBox = [
+    outLeft + 8,
+    outsideHeaderBox[3] + 6,
+    outRight - 8,
+    outBottom - 40,
+  ];
   {
-    const { font, w, h } = fitTextInBox(ctx, tempStr, tempTextBox, 180, 80);
+    const { font, w, h } = fitTextInBox(ctx, tempStr, tempValueBox, 180, 70);
     ctx.font = font;
-    const cx = (tempTextBox[0] + tempTextBox[2]) / 2;
-    const cy = (tempTextBox[1] + tempTextBox[3]) / 2;
+    const cx = (tempValueBox[0] + tempValueBox[2]) / 2;
+    const cy = (tempValueBox[1] + tempValueBox[3]) / 2;
     ctx.fillText(tempStr, cx - w / 2, cy - h / 2);
   }
 
+  // Wind chill, if any
   if (windChillValue != null) {
     const n = parseFloat(windChillValue);
     const wcStr = !Number.isNaN(n)
       ? `[${n.toFixed(0)}${tempUnit} wind chill]`
       : `[${windChillValue} ${tempUnit} wind chill]`;
-    ctx.font = fontSpec(SMALL_SIZE);
-    const { w: wcW, h: wcH } = textSize(ctx, wcStr);
-    const wcCx = (tempBoxLeft + tempBoxRight) / 2;
-    const wcX = wcCx - wcW / 2;
-    const wcY = tempBoxBottom - wcH - 4;
-    ctx.fillText(wcStr, wcX, wcY);
+    const wcBox = [outLeft + 8, outBottom - 36, outRight - 8, outBottom - 8];
+    const { font, w, h } = fitTextInBox(ctx, wcStr, wcBox, 22, 12);
+    ctx.font = font;
+    const cx = (wcBox[0] + wcBox[2]) / 2;
+    const cy = (wcBox[1] + wcBox[3]) / 2;
+    ctx.fillText(wcStr, cx - w / 2, cy - h / 2);
   }
 
-  // ===== RIGHT COLUMN BOTTOM: weather icon (centered in its quadrant) =====
-  const iconBoxLeft = splitX + 10;
-  const iconBoxTop = CANVAS_HEIGHT / 2 + 10;
-  const iconBoxRight = CANVAS_WIDTH - margin;
-  const iconBoxBottom = CANVAS_HEIGHT - margin - 10;
+  // ===== BOTTOM-LEFT: 2x2 grid (inside temp, hot tub, humidity, icon) =====
+  const blLeft = contentLeft;
+  const blTop = midY;
+  const blRight = splitX;
+  const blBottom = contentBottom;
 
-  await drawWeatherIcon(
-    ctx,
-    [iconBoxLeft, iconBoxTop, iconBoxRight, iconBoxBottom],
-    condition,
-    wAttrs
-  );
+  const blTopHeight = bottomMidY - blTop;
+  const blBottomHeight = blBottom - bottomMidY;
 
-  // ===== GRID LINES (4 quadrants + inner 4 in bottom-left) =====
+  // Inside temp (top-left of bottom-left)
+  const insideCell = [blLeft, blTop, leftMidX, bottomMidY];
+  const hotTubCell = [leftMidX, blTop, blRight, bottomMidY];
+  const humCell = [blLeft, bottomMidY, leftMidX, blBottom];
+  const iconCell = [leftMidX, bottomMidY, blRight, blBottom];
+
+  // Inside Temp
+  let insideTempText = "\u2014";
+  if (insideTempVal != null) {
+    const unit = insideTempUnit || "°C";
+    insideTempText = `${insideTempVal.toFixed(1)}${unit}`;
+  }
+  {
+    const label = "Inside Temp";
+    const labelBox = [
+      insideCell[0] + 6,
+      insideCell[1] + 4,
+      insideCell[2] - 6,
+      insideCell[1] + 26,
+    ];
+    const { font, w, h } = fitTextInBox(ctx, label, labelBox, 22, LABEL_MIN_SIZE);
+    ctx.font = font;
+    const cx = (labelBox[0] + labelBox[2]) / 2;
+    const cy = (labelBox[1] + labelBox[3]) / 2;
+    ctx.fillText(label, cx - w / 2, cy - h / 2);
+
+    const valueBox = [
+      insideCell[0] + 6,
+      labelBox[3] + 4,
+      insideCell[2] - 6,
+      insideCell[3] - 6,
+    ];
+    const vMetrics = fitTextInBox(ctx, insideTempText, valueBox, 80, 28);
+    ctx.font = vMetrics.font;
+    const vcx = (valueBox[0] + valueBox[2]) / 2;
+    const vcy = (valueBox[1] + valueBox[3]) / 2;
+    ctx.fillText(insideTempText, vcx - vMetrics.w / 2, vcy - vMetrics.h / 2);
+  }
+
+  // Hot Tub Temp
+  let hottubTempText = "\u2014";
+  if (hottubTempVal != null) {
+    const unit = hottubTempUnit || "°C";
+    hottubTempText = `${hottubTempVal.toFixed(1)}${unit}`;
+  }
+  {
+    const label = "Hot Tub Temp";
+    const labelBox = [
+      hotTubCell[0] + 6,
+      hotTubCell[1] + 4,
+      hotTubCell[2] - 6,
+      hotTubCell[1] + 26,
+    ];
+    const { font, w, h } = fitTextInBox(ctx, label, labelBox, 22, LABEL_MIN_SIZE);
+    ctx.font = font;
+    const cx = (labelBox[0] + labelBox[2]) / 2;
+    const cy = (labelBox[1] + labelBox[3]) / 2;
+    ctx.fillText(label, cx - w / 2, cy - h / 2);
+
+    const valueBox = [
+      hotTubCell[0] + 6,
+      labelBox[3] + 4,
+      hotTubCell[2] - 6,
+      hotTubCell[3] - 6,
+    ];
+    const vMetrics = fitTextInBox(ctx, hottubTempText, valueBox, 80, 28);
+    ctx.font = vMetrics.font;
+    const vcx = (valueBox[0] + valueBox[2]) / 2;
+    const vcy = (valueBox[1] + valueBox[3]) / 2;
+    ctx.fillText(hottubTempText, vcx - vMetrics.w / 2, vcy - vMetrics.h / 2);
+  }
+
+  // Inside Humidity
+  let humText = "\u2014";
+  if (insideHumVal != null) humText = `${insideHumVal.toFixed(0)}%`;
+  {
+    const label = "Inside Humidity";
+    const labelBox = [
+      humCell[0] + 6,
+      humCell[1] + 4,
+      humCell[2] - 6,
+      humCell[1] + 26,
+    ];
+    const { font, w, h } = fitTextInBox(ctx, label, labelBox, 22, LABEL_MIN_SIZE);
+    ctx.font = font;
+    const cx = (labelBox[0] + labelBox[2]) / 2;
+    const cy = (labelBox[1] + labelBox[3]) / 2;
+    ctx.fillText(label, cx - w / 2, cy - h / 2);
+
+    const valueBox = [
+      humCell[0] + 6,
+      labelBox[3] + 4,
+      humCell[2] - 6,
+      humCell[3] - 6,
+    ];
+    const vMetrics = fitTextInBox(ctx, humText, valueBox, 80, 28);
+    ctx.font = vMetrics.font;
+    const vcx = (valueBox[0] + valueBox[2]) / 2;
+    const vcy = (valueBox[1] + valueBox[3]) / 2;
+    ctx.fillText(humText, vcx - vMetrics.w / 2, vcy - vMetrics.h / 2);
+  }
+
+  // Icon + tiny timestamp (bottom-right of bottom-left quadrant)
+  const timeBandHeight = TIME_FONT_SIZE + 6;
+
+  {
+    // leave a thin band at bottom for time
+    const iconBox = [
+      iconCell[0] + 6,
+      iconCell[1] + 6,
+      iconCell[2] - 6,
+      iconCell[3] - 6 - timeBandHeight,
+    ];
+    await drawWeatherIcon(ctx, iconBox, condition, wAttrs);
+  }
+
+  // ISO timestamp, no "Updated"
+  const timestampText = now.toISOString().slice(0, 16).replace("T", " ");
+  ctx.font = fontSpec(TIME_FONT_SIZE);
+  const { w: tsW, h: tsH } = textSize(ctx, timestampText);
+  const tsCx = (iconCell[0] + iconCell[2]) / 2;
+  const tsX = tsCx - tsW / 2;
+  const tsY = iconCell[3] - tsH - 2;
+  ctx.fillText(timestampText, tsX, tsY);
+
+
+  // ===== BOTTOM-RIGHT: Location + Date =====
+  const brLeft = splitX;
+  const brTop = midY;
+  const brRight = contentRight;
+  const brBottom = contentBottom;
+
+  const locBoxBottom = brTop + (brBottom - brTop) * 0.5;
+  const dateBoxTop = locBoxBottom;
+
+    // Location + Summary box (top half of bottom-right quadrant)
+  const locBox = [brLeft, brTop, brRight, locBoxBottom];
+
+  // "Location" header
+  const locHeaderBox = [
+    locBox[0] + 6,
+    locBox[1] + 4,
+    locBox[2] - 6,
+    locBox[1] + 30,
+  ];
+  {
+    const header = "Location";
+    ctx.font = fontSpec(HEADER_LABEL_SIZE);
+    const { w, h } = textSize(ctx, header);
+    const cx = (locHeaderBox[0] + locHeaderBox[2]) / 2;
+    const cy = (locHeaderBox[1] + locHeaderBox[3]) / 2;
+    ctx.fillText(header, cx - w / 2, cy - h / 2);
+  }
+  const locRowsTop = locHeaderBox[3] + 8;
+  const locRowsBottom = locBox[3] - 8;
+
+  // Rows: 2 location rows, "Summary" header row, then 3 summary rows
+  const locRowsData = [
+    { type: "pair", label: "Dave", value: daveLoc },
+    { type: "pair", label: "Kayla", value: kaylaLoc },
+    { type: "header", text: "Summary" },
+    { type: "pair", label: "Lights", value: lightsText },
+    { type: "pair", label: "Fans", value: fansText },
+    { type: "pair", label: "Torrents", value: torrentsText },
+  ];
+
+  const locRowCount = locRowsData.length;
+  const locRowHeight = (locRowsBottom - locRowsTop) / locRowCount;
+  const locMidX = locBox[0] + (locBox[2] - locBox[0]) / 2;
+
+  const locRowBounds = [];
+
+  for (let i = 0; i < locRowCount; i++) {
+    const rowTop = locRowsTop + i * locRowHeight;
+    const rowBottom =
+      i === locRowCount - 1 ? locRowsBottom : rowTop + locRowHeight;
+    const row = locRowsData[i];
+
+    locRowBounds.push({ top: rowTop, bottom: rowBottom });
+
+      if (row.type === "header") {
+      // "Summary" centred across both columns, same size as "Location"
+      const headerBox = [
+        locBox[0] + 8,
+        rowTop + 4,
+        locBox[2] - 8,
+        rowBottom - 4,
+      ];
+      ctx.font = fontSpec(HEADER_LABEL_SIZE);
+      const { w, h } = textSize(ctx, row.text);
+      const cx = (headerBox[0] + headerBox[2]) / 2;
+      const cy = (headerBox[1] + headerBox[3]) / 2;
+      ctx.fillText(row.text, cx - w / 2, cy - h / 2);
+    } else {
+      // Label/value row
+     const leftBox = [
+       locBox[0] + 8,
+       rowTop + 4,
+       locMidX - 4,
+       rowBottom - 4,
+     ];
+     const rightBox = [
+       locMidX + 4,
+       rowTop + 4,
+       locBox[2] - 8,
+       rowBottom - 4,
+     ];
+
+      // Label
+      {
+        const { font, w, h } = fitTextInBox(
+          ctx,
+          row.label,
+          leftBox,
+          22,
+          LABEL_MIN_SIZE
+        );
+        ctx.font = font;
+        const cx = (leftBox[0] + leftBox[2]) / 2;
+        const cy = (leftBox[1] + leftBox[3]) / 2;
+        ctx.fillText(row.label, cx - w / 2, cy - h / 2);
+      }
+
+      // Value (auto-sized)
+      {
+        const { font, w, h } = fitTextInBox(
+          ctx,
+          row.value,
+          rightBox,
+          24,
+          LABEL_MIN_SIZE
+        );
+        ctx.font = font;
+        const cx = (rightBox[0] + rightBox[2]) / 2;
+        const cy = (rightBox[1] + rightBox[3]) / 2;
+        ctx.fillText(row.value, cx - w / 2, cy - h / 2);
+      }
+    }
+  }
+
+   // Date box: vertical DOW at left, month top-right, big day number below
+  const dateBox = [brLeft, dateBoxTop, brRight, brBottom];
+
+  const dateLeft = dateBox[0];
+  const dateTop = dateBox[1];
+  const dateRight = dateBox[2];
+  const dateBottom = dateBox[3];
+
+  const dateW = dateRight - dateLeft;
+  const dateH = dateBottom - dateTop;
+
+  // Narrow vertical stripe for DOW
+  const dowAreaW = Math.min(dateW * 0.3, 80);
+  const dowArea = [dateLeft, dateTop, dateLeft + dowAreaW, dateBottom];
+  const rightArea = [dateLeft + dowAreaW, dateTop, dateRight, dateBottom];
+
+  const dow = now
+    .toLocaleString("en-US", { weekday: "short" })
+    .toUpperCase();
+
+  // 3-letter DOW, vertical, hugging left edge with a small margin
+  {
+    const [dl, dt, dr, db] = dowArea;
+    const areaW = dr - dl;
+    const areaH = db - dt;
+
+    const { font, w, h } = fitTextInBox(
+      ctx,
+      dow,
+      [0, 0, areaH - 8, areaW - 8],
+      120,
+      28
+    );
+
+    ctx.save();
+    ctx.font = font;
+    ctx.textBaseline = "top";
+    ctx.textAlign = "left";
+
+    // push slightly in from the left, vertically centred
+    const cx = dl + 16; // a bit more to the right
+    const cy = dt + areaH / 2;
+
+    ctx.translate(cx, cy);
+    ctx.rotate(-Math.PI / 2); // draw vertically
+    ctx.fillText(dow, -w / 2, -h / 2);
+    ctx.restore();
+  }
+
+  // Right area: month on top (right-aligned), big day number below
+  const [raL, raT, raR, raB] = rightArea;
+  const monthBox = [raL + 4, raT + 4, raR - 4, raT + dateH * 0.35];
+  const dayBox = [raL + 4, monthBox[3] + 4, raR - 4, raB - 4];
+
+  const monthName = now.toLocaleString("en-US", { month: "long" });
+
+  // Month – right aligned at the top so it doesn't collide with DOW
+  {
+    const { font, w, h } = fitTextInBox(ctx, monthName, monthBox, 32, 16);
+    ctx.font = font;
+    const x = monthBox[2] - 2; // right edge with small inset
+    const y = monthBox[1] + (monthBox[3] - monthBox[1] - h) / 2;
+    ctx.fillText(monthName, x - w, y);
+  }
+
+  // Big day number + suffix using remaining space
+  const dayNum = now.getDate();
+  const dayStr = String(dayNum);
+  const daySuffix = ordinalSuffix(dayNum);
+
+  {
+const { font, w, h } = fitTextInBox(
+   ctx,
+   dayStr,
+   dayBox,
+   180,
+   70
+ );
+     ctx.font = font;
+    const cx = (dayBox[0] + dayBox[2]) / 2;
+    const cy = (dayBox[1] + dayBox[3]) / 2;
+    const dayX = cx - w / 2;
+    const dayY = cy - h / 2;
+    ctx.fillText(dayStr, dayX, dayY);
+
+    // Small suffix in the top-right corner of the number
+    const match = /(\d+)px/.exec(font);
+    const baseSize = match ? parseInt(match[1], 10) : 24;
+    const suffixSize = Math.max(10, Math.floor(baseSize * 0.3));
+    ctx.font = fontSpec(suffixSize);
+    const { w: sW, h: sH } = textSize(ctx, daySuffix);
+    const suffixX = dayX + w + 4;
+    const suffixY = dayY + 4;
+    ctx.fillText(daySuffix, suffixX, suffixY);
+  }
+
+
+  // ===== GRID LINES =====
   ctx.save();
   ctx.strokeStyle = "#000000";
-  ctx.lineWidth = 1;
 
-  // Outer border
-  ctx.strokeRect(margin, margin, CANVAS_WIDTH - 2 * margin, CANVAS_HEIGHT - 2 * margin);
-
-  const midY = CANVAS_HEIGHT / 2;
+  // Outer border & major splits thicker
+  ctx.lineWidth = 2;
+  ctx.strokeRect(
+    contentLeft,
+    contentTop,
+    contentRight - contentLeft,
+    contentBottom - contentTop
+  );
 
   // Vertical split (left/right)
   ctx.beginPath();
-  ctx.moveTo(splitX, margin);
-  ctx.lineTo(splitX, CANVAS_HEIGHT - margin);
+  ctx.moveTo(splitX, contentTop);
+  ctx.lineTo(splitX, contentBottom);
   ctx.stroke();
 
   // Horizontal split (top/bottom)
   ctx.beginPath();
-  ctx.moveTo(margin, midY);
-  ctx.lineTo(CANVAS_WIDTH - margin, midY);
+  ctx.moveTo(contentLeft, midY);
+  ctx.lineTo(contentRight, midY);
   ctx.stroke();
 
-  // Bottom-left inner vertical (between Inside/HotTub, Humidity/Transmission)
+  // Bottom-left inner vertical & horizontal (2x2)
   ctx.beginPath();
-  ctx.moveTo(leftMidSplit, midY);
-  ctx.lineTo(leftMidSplit, CANVAS_HEIGHT - margin);
+  ctx.moveTo(leftMidX, midY);
+  ctx.lineTo(leftMidX, contentBottom);
   ctx.stroke();
 
-  // Bottom-left inner horizontal (between top & bottom rows)
   ctx.beginPath();
-  ctx.moveTo(margin, insideRowBottom);
-  ctx.lineTo(leftColRight, insideRowBottom);
+  ctx.moveTo(contentLeft, bottomMidY);
+  ctx.lineTo(splitX, bottomMidY);
   ctx.stroke();
+
+  // Bottom-right horizontal split (Location / Date)
+  ctx.beginPath();
+  ctx.moveTo(brLeft, locBoxBottom);
+  ctx.lineTo(brRight, locBoxBottom);
+  ctx.stroke();
+
+  // Location inner vertical – skip the "Summary" row (index 2)
+  if (locRowBounds.length >= 3) {
+    const summaryBounds = locRowBounds[2];
+
+    // From top to top of Summary
+    ctx.beginPath();
+    ctx.moveTo(locMidX, locRowsTop);
+    ctx.lineTo(locMidX, summaryBounds.top);
+    ctx.stroke();
+
+    // From bottom of Summary to bottom
+    ctx.beginPath();
+    ctx.moveTo(locMidX, summaryBounds.bottom);
+    ctx.lineTo(locMidX, locRowsBottom);
+    ctx.stroke();
+  } else {
+    ctx.beginPath();
+    ctx.moveTo(locMidX, locRowsTop);
+    ctx.lineTo(locMidX, locRowsBottom);
+    ctx.stroke();
+  }
+
+
+  // Thinner detail lines
+  ctx.lineWidth = 1;
+
+  // Weather detail row lines:
+  //  - one line under the condition header
+  //  - one line between each detail row (not under the last row – midY handles that)
+  if (detailRowBounds.length > 0) {
+    const firstTop = detailRowBounds[0].top;
+    ctx.beginPath();
+    ctx.moveTo(weatherLeft, firstTop);
+    ctx.lineTo(weatherRight, firstTop);
+    ctx.stroke();
+
+    for (let i = 0; i < detailRowBounds.length - 1; i++) {
+      const { bottom } = detailRowBounds[i];
+      ctx.beginPath();
+      ctx.moveTo(weatherLeft, bottom);
+      ctx.lineTo(weatherRight, bottom);
+      ctx.stroke();
+    }
+  }
+
+  // Location row horizontal lines:
+  //  - one line above the first row
+  //  - one line between each row (bottom of each, except the last)
+  if (locRowBounds.length > 0) {
+    const firstTop = locRowBounds[0].top;
+    ctx.beginPath();
+    ctx.moveTo(locBox[0], firstTop);
+    ctx.lineTo(locBox[2], firstTop);
+    ctx.stroke();
+
+    for (let i = 0; i < locRowBounds.length - 1; i++) {
+      const { bottom } = locRowBounds[i];
+      ctx.beginPath();
+      ctx.moveTo(locBox[0], bottom);
+      ctx.lineTo(locBox[2], bottom);
+      ctx.stroke();
+    }
+  }
 
   ctx.restore();
 
+
   return canvas;
 }
+
 
 // ===== Buffers for Kobo + PNG preview =====
 async function buildKoboRawBuffer() {
