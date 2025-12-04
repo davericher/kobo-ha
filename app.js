@@ -1,56 +1,236 @@
 #!/usr/bin/env node
 // app.js
 // Kobo dashboard server using skia-canvas, with RAW + PNG outputs
+// Now with Home Assistant WebSocket live cache.
 
 import http from "node:http";
 import { Canvas, loadImage } from "skia-canvas";
+import WebSocket from "ws";
 
 // ===== Config via environment variables =====
-const HA_URL = (process.env.HA_URL || "http://homeassistant:8123").replace(/\/+$/, "");
-
+const HA_URL = (process.env.HA_URL || "http://homeassistant:8123").replace(
+  /\/+$/,
+  ""
+);
 const HA_TOKEN = process.env.HA_TOKEN || "";
 
 const WEATHER_ENTITY = process.env.WEATHER_ENTITY || "weather.provider";
-
-const DL_ENTITY = process.env.DL_ENTITY || "sensor.transmission_download_speed";
-
-const UL_ENTITY = process.env.UL_ENTITY || "sensor.transmission_upload_speed";
+const DL_ENTITY =
+  process.env.DL_ENTITY || "sensor.transmission_download_speed";
+const UL_ENTITY =
+  process.env.UL_ENTITY || "sensor.transmission_upload_speed";
 
 // Inside sensors
 const INSIDE_TEMP_ENTITY = process.env.INSIDE_TEMP_ENTITY || "";
-
 const INSIDE_HUMIDITY_ENTITY = process.env.INSIDE_HUMIDITY_ENTITY || "";
-
 const HOTTUB_TEMP_ENTITY = process.env.HOTTUB_TEMP_ENTITY || "";
 
 // New “location” / counts
 const LIGHTS_ON_ENTITY = process.env.LIGHTS_ON_ENTITY || "";
-
 const FANS_ON_ENTITY = process.env.FANS_ON_ENTITY || "";
-
 const TORRENTS_ENTITY =
   process.env.TORRENTS_ENTITY || "sensor.transmission_total_torrents";
 
-  const PERSON_DAVE_ENTITY =
-  process.env.PERSON_DAVE_ENTITY || "person.dave";
-
-  const PERSON_KAYLA_ENTITY =
-  process.env.PERSON_KAYLA_ENTITY || "person.kayla";
-
+const PERSON_DAVE_ENTITY = process.env.PERSON_DAVE_ENTITY || "person.dave";
+const PERSON_KAYLA_ENTITY = process.env.PERSON_KAYLA_ENTITY || "person.kayla";
 
 // Bind Host/Port
 const BIND_HOST = process.env.BIND_HOST || "0.0.0.0";
 const BIND_PORT = parseInt(process.env.BIND_PORT || "8080", 10);
 
-
 // Logical canvas in LANDSCAPE. We’ll rotate it at the end to 600x800 portrait.
 const CANVAS_WIDTH = 800;
 const CANVAS_HEIGHT = 600;
 
+// Optional GPU toggle for skia-canvas
+const SKIA_USE_GPU = /^1|true|yes$/i.test(process.env.SKIA_GPU || "");
+
+// REST headers for HA
 const HA_HEADERS = {
   ...(HA_TOKEN ? { Authorization: `Bearer ${HA_TOKEN}` } : {}),
   "Content-Type": "application/json",
 };
+
+// ===== Home Assistant WebSocket live cache =====
+
+const stateCache = new Map(); // entity_id -> { state, attributes }
+let cacheReady = false;
+
+let ws = null;
+let wsConnected = false;
+let wsAuthOk = false;
+let wsIdCounter = 1;
+let wsReconnectTimer = null;
+
+// Build ws:// or wss:// URL from HA_URL
+const HA_WS_URL = (() => {
+  try {
+    const url = new URL(HA_URL);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    url.pathname = "/api/websocket";
+    url.search = "";
+    return url.toString();
+  } catch {
+    return HA_URL.replace(/^http/, "ws") + "/api/websocket";
+  }
+})();
+
+function setCacheFromStatesArray(arr) {
+  stateCache.clear();
+  for (const s of arr || []) {
+    if (!s || !s.entity_id) continue;
+    stateCache.set(s.entity_id, {
+      state: s.state,
+      attributes: s.attributes || {},
+    });
+  }
+  if (stateCache.size > 0) {
+    cacheReady = true;
+  }
+}
+
+async function seedStatesFromRest() {
+  try {
+    const res = await fetch(`${HA_URL}/api/states`, { headers: HA_HEADERS });
+    if (!res.ok) throw new Error(`HA /api/states HTTP ${res.status}`);
+    const all = await res.json();
+    setCacheFromStatesArray(all);
+    console.log(
+      `[kobo-dashboard] Seeded ${stateCache.size} HA states from REST`
+    );
+  } catch (e) {
+    console.error("[kobo-dashboard] Error seeding HA state cache:", e.message);
+  }
+}
+
+function sendWs(msg) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
+  }
+}
+
+function subscribeStateChanged() {
+  const id = wsIdCounter++;
+  sendWs({
+    id,
+    type: "subscribe_events",
+    event_type: "state_changed",
+  });
+}
+
+function scheduleReconnect() {
+  if (wsReconnectTimer) return;
+  wsReconnectTimer = setTimeout(() => {
+    wsReconnectTimer = null;
+    connectWebSocket();
+  }, 5000);
+}
+
+function handleWsMessage(data) {
+  let msg;
+  try {
+    msg = JSON.parse(data.toString());
+  } catch {
+    return;
+  }
+
+  if (msg.type === "auth_required") {
+    // reply with auth
+    sendWs({ type: "auth", access_token: HA_TOKEN });
+    return;
+  }
+
+  if (msg.type === "auth_ok") {
+    wsAuthOk = true;
+    console.log("[kobo-dashboard] HA websocket auth_ok");
+    // Seed initial state snapshot via REST, then subscribe to changes
+    seedStatesFromRest().then(() => {
+      subscribeStateChanged();
+    });
+    return;
+  }
+
+  if (msg.type === "auth_invalid") {
+    wsAuthOk = false;
+    console.error(
+      "[kobo-dashboard] HA websocket auth_invalid:",
+      msg.message || ""
+    );
+    try {
+      ws.close();
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
+
+  if (msg.type === "event" && msg.event?.event_type === "state_changed") {
+    const newState = msg.event.data?.new_state;
+    if (newState && newState.entity_id) {
+      stateCache.set(newState.entity_id, {
+        state: newState.state,
+        attributes: newState.attributes || {},
+      });
+      cacheReady = true;
+    }
+    return;
+  }
+
+  // We don't care about "result" or other events here.
+}
+
+function connectWebSocket() {
+  if (!HA_TOKEN) {
+    console.warn(
+      "[kobo-dashboard] HA_TOKEN not set; WebSocket live cache disabled (REST fallback only)."
+    );
+    return;
+  }
+
+  try {
+    console.log("[kobo-dashboard] Connecting to HA websocket:", HA_WS_URL);
+    ws = new WebSocket(HA_WS_URL);
+
+    ws.on("open", () => {
+      wsConnected = true;
+      wsAuthOk = false;
+      console.log("[kobo-dashboard] HA websocket open");
+    });
+
+    ws.on("message", handleWsMessage);
+
+    ws.on("close", (code, reason) => {
+      wsConnected = false;
+      wsAuthOk = false;
+      console.warn(
+        `[kobo-dashboard] HA websocket closed (${code}): ${
+          reason?.toString() || ""
+        }`
+      );
+      scheduleReconnect();
+    });
+
+    ws.on("error", (err) => {
+      console.error("[kobo-dashboard] HA websocket error:", err.message);
+      // close event will schedule reconnect
+    });
+  } catch (e) {
+    console.error("[kobo-dashboard] Failed to create HA websocket:", e.message);
+    scheduleReconnect();
+  }
+}
+
+// Kick off websocket connection & one-time initial seed (in case ws is slow)
+connectWebSocket();
+seedStatesFromRest();
+
+// Helper to read from cache
+function haStateFromCache(entityId) {
+  if (!entityId) return [null, {}];
+  const entry = stateCache.get(entityId);
+  if (!entry) return [null, {}];
+  return [entry.state, entry.attributes || {}];
+}
 
 // ===== Helpers =====
 
@@ -73,7 +253,15 @@ function textSize(ctx, text) {
   return { w, h };
 }
 
+// Primary HA state accessor: prefer cache; REST as cold-start fallback
 async function haState(entityId) {
+  if (!entityId) return [null, {}];
+
+  if (cacheReady) {
+    return haStateFromCache(entityId);
+  }
+
+  // Cold-start / fallback
   const url = `${HA_URL}/api/states/${entityId}`;
   const res = await fetch(url, { headers: HA_HEADERS });
   if (!res.ok) throw new Error(`HA ${entityId} HTTP ${res.status}`);
@@ -182,14 +370,6 @@ function formatPersonLocation(state) {
   return titleCase(state);
 }
 
-function formatOnOff(state) {
-  if (!state) return "—";
-  const s = String(state).toLowerCase();
-  if (s === "on" || s === "true") return "On";
-  if (s === "off" || s === "false") return "Off";
-  return titleCase(state);
-}
-
 function ordinalSuffix(n) {
   const v = n % 100;
   if (v >= 11 && v <= 13) return "th";
@@ -203,22 +383,6 @@ function ordinalSuffix(n) {
     default:
       return "th";
   }
-}
-
-
-function underline(ctx, text, x, y, fontSize) {
-  // x,y = top-left of the text (with baseline "top")
-  ctx.save();
-  ctx.font = fontSpec(fontSize);
-  const { w } = textSize(ctx, text);
-  const underlineY = y + fontSize + 2;
-  ctx.beginPath();
-  ctx.moveTo(x, underlineY);
-  ctx.lineTo(x + w, underlineY);
-  ctx.strokeStyle = "#000000";
-  ctx.lineWidth = 1;
-  ctx.stroke();
-  ctx.restore();
 }
 
 async function drawWeatherIcon(ctx, box, condition, wAttrs) {
@@ -272,11 +436,12 @@ async function drawWeatherIcon(ctx, box, condition, wAttrs) {
 
 // Rotate landscape -> portrait (600x800), USB on the right
 function rotateToPortrait(canvas) {
-  const rotated = new Canvas(600, 800, { gpu: true });
+  const rotated = new Canvas(600, 800, { gpu: SKIA_USE_GPU });
   const rctx = rotated.getContext("2d");
   rctx.fillStyle = "#ffffff";
   rctx.fillRect(0, 0, rotated.width, rotated.height);
 
+  rctx.setTransform(1, 0, 0, 1, 0, 0);
   rctx.translate(0, rotated.height);
   rctx.rotate(-Math.PI / 2);
   rctx.drawImage(canvas, 0, 0);
@@ -284,9 +449,10 @@ function rotateToPortrait(canvas) {
 }
 
 // ===== Main LANDSCAPE renderer =====
-// ===== Main LANDSCAPE renderer =====
 async function buildLandscapeCanvas() {
-  const canvas = new Canvas(CANVAS_WIDTH, CANVAS_HEIGHT, { gpu: false });
+  const canvas = new Canvas(CANVAS_WIDTH, CANVAS_HEIGHT, {
+    gpu: SKIA_USE_GPU,
+  });
   const ctx = canvas.getContext("2d");
 
   // White background
@@ -304,7 +470,7 @@ async function buildLandscapeCanvas() {
   const LABEL_MIN_SIZE = 14;
   const SMALL_SIZE = 18;
   const TIME_FONT_SIZE = 10;
-  const HEADER_LABEL_SIZE = 20
+  const HEADER_LABEL_SIZE = 20;
 
   const margin = 12;
   const contentLeft = margin;
@@ -322,7 +488,7 @@ async function buildLandscapeCanvas() {
   const bottomHeight = contentBottom - midY;
   const bottomMidY = midY + bottomHeight / 2;
 
-  // ===== Fetch weather data =====
+  // ===== Fetch weather data (from cache / REST) =====
   let weatherState, wAttrs;
   try {
     [weatherState, wAttrs] = await haState(WEATHER_ENTITY);
@@ -440,10 +606,8 @@ async function buildLandscapeCanvas() {
   const detailRowHeight = (detailBottom - detailStartY) / detailRowsCount;
 
   const detailTexts = (() => {
-    const humStr =
-      humidityOut != null ? `${humidityOut}%` : "\u2014"; // —
-    const presStr =
-      pressure != null ? `${pressure} hPa` : "\u2014";
+    const humStr = humidityOut != null ? `${humidityOut}%` : "\u2014"; // —
+    const presStr = pressure != null ? `${pressure} hPa` : "\u2014";
     let windStr = "—";
     if (windSpeed != null) {
       const n = parseFloat(windSpeed);
@@ -453,8 +617,7 @@ async function buildLandscapeCanvas() {
       const bearing = windBearing ? ` ${windBearing}` : "";
       windStr = `${speed}${bearing}`.trim();
     }
-    const cloudStr =
-      cloudCoverage != null ? `${cloudCoverage}%` : "\u2014";
+    const cloudStr = cloudCoverage != null ? `${cloudCoverage}%` : "\u2014";
     const uvStr = uvIndex != null ? String(uvIndex) : "\u2014";
     const txStr = `Up: ${ulText}   Down: ${dlText}`;
     return [
@@ -558,10 +721,6 @@ async function buildLandscapeCanvas() {
   const blRight = splitX;
   const blBottom = contentBottom;
 
-  const blTopHeight = bottomMidY - blTop;
-  const blBottomHeight = blBottom - bottomMidY;
-
-  // Inside temp (top-left of bottom-left)
   const insideCell = [blLeft, blTop, leftMidX, bottomMidY];
   const hotTubCell = [leftMidX, blTop, blRight, bottomMidY];
   const humCell = [blLeft, bottomMidY, leftMidX, blBottom];
@@ -581,7 +740,13 @@ async function buildLandscapeCanvas() {
       insideCell[2] - 6,
       insideCell[1] + 26,
     ];
-    const { font, w, h } = fitTextInBox(ctx, label, labelBox, 22, LABEL_MIN_SIZE);
+    const { font, w, h } = fitTextInBox(
+      ctx,
+      label,
+      labelBox,
+      22,
+      LABEL_MIN_SIZE
+    );
     ctx.font = font;
     const cx = (labelBox[0] + labelBox[2]) / 2;
     const cy = (labelBox[1] + labelBox[3]) / 2;
@@ -614,7 +779,13 @@ async function buildLandscapeCanvas() {
       hotTubCell[2] - 6,
       hotTubCell[1] + 26,
     ];
-    const { font, w, h } = fitTextInBox(ctx, label, labelBox, 22, LABEL_MIN_SIZE);
+    const { font, w, h } = fitTextInBox(
+      ctx,
+      label,
+      labelBox,
+      22,
+      LABEL_MIN_SIZE
+    );
     ctx.font = font;
     const cx = (labelBox[0] + labelBox[2]) / 2;
     const cy = (labelBox[1] + labelBox[3]) / 2;
@@ -644,7 +815,13 @@ async function buildLandscapeCanvas() {
       humCell[2] - 6,
       humCell[1] + 26,
     ];
-    const { font, w, h } = fitTextInBox(ctx, label, labelBox, 22, LABEL_MIN_SIZE);
+    const { font, w, h } = fitTextInBox(
+      ctx,
+      label,
+      labelBox,
+      22,
+      LABEL_MIN_SIZE
+    );
     ctx.font = font;
     const cx = (labelBox[0] + labelBox[2]) / 2;
     const cy = (labelBox[1] + labelBox[3]) / 2;
@@ -667,7 +844,6 @@ async function buildLandscapeCanvas() {
   const timeBandHeight = TIME_FONT_SIZE + 6;
 
   {
-    // leave a thin band at bottom for time
     const iconBox = [
       iconCell[0] + 6,
       iconCell[1] + 6,
@@ -686,7 +862,6 @@ async function buildLandscapeCanvas() {
   const tsY = iconCell[3] - tsH - 2;
   ctx.fillText(timestampText, tsX, tsY);
 
-
   // ===== BOTTOM-RIGHT: Location + Date =====
   const brLeft = splitX;
   const brTop = midY;
@@ -696,7 +871,7 @@ async function buildLandscapeCanvas() {
   const locBoxBottom = brTop + (brBottom - brTop) * 0.5;
   const dateBoxTop = locBoxBottom;
 
-    // Location + Summary box (top half of bottom-right quadrant)
+  // Location + Summary box (top half of bottom-right quadrant)
   const locBox = [brLeft, brTop, brRight, locBoxBottom];
 
   // "Location" header
@@ -741,7 +916,7 @@ async function buildLandscapeCanvas() {
 
     locRowBounds.push({ top: rowTop, bottom: rowBottom });
 
-      if (row.type === "header") {
+    if (row.type === "header") {
       // "Summary" centred across both columns, same size as "Location"
       const headerBox = [
         locBox[0] + 8,
@@ -756,18 +931,18 @@ async function buildLandscapeCanvas() {
       ctx.fillText(row.text, cx - w / 2, cy - h / 2);
     } else {
       // Label/value row
-     const leftBox = [
-       locBox[0] + 8,
-       rowTop + 4,
-       locMidX - 4,
-       rowBottom - 4,
-     ];
-     const rightBox = [
-       locMidX + 4,
-       rowTop + 4,
-       locBox[2] - 8,
-       rowBottom - 4,
-     ];
+      const leftBox = [
+        locBox[0] + 8,
+        rowTop + 4,
+        locMidX - 4,
+        rowBottom - 4,
+      ];
+      const rightBox = [
+        locMidX + 4,
+        rowTop + 4,
+        locBox[2] - 8,
+        rowBottom - 4,
+      ];
 
       // Label
       {
@@ -801,7 +976,7 @@ async function buildLandscapeCanvas() {
     }
   }
 
-   // Date box: vertical DOW at left, month top-right, big day number below
+  // Date box: vertical DOW at left, month top-right, big day number below
   const dateBox = [brLeft, dateBoxTop, brRight, brBottom];
 
   const dateLeft = dateBox[0];
@@ -840,7 +1015,6 @@ async function buildLandscapeCanvas() {
     ctx.textBaseline = "top";
     ctx.textAlign = "left";
 
-    // push slightly in from the left, vertically centred
     const cx = dl + 16; // a bit more to the right
     const cy = dt + areaH / 2;
 
@@ -872,14 +1046,8 @@ async function buildLandscapeCanvas() {
   const daySuffix = ordinalSuffix(dayNum);
 
   {
-const { font, w, h } = fitTextInBox(
-   ctx,
-   dayStr,
-   dayBox,
-   180,
-   70
- );
-     ctx.font = font;
+    const { font, w, h } = fitTextInBox(ctx, dayStr, dayBox, 180, 70);
+    ctx.font = font;
     const cx = (dayBox[0] + dayBox[2]) / 2;
     const cy = (dayBox[1] + dayBox[3]) / 2;
     const dayX = cx - w / 2;
@@ -896,7 +1064,6 @@ const { font, w, h } = fitTextInBox(
     const suffixY = dayY + 4;
     ctx.fillText(daySuffix, suffixX, suffixY);
   }
-
 
   // ===== GRID LINES =====
   ctx.save();
@@ -962,13 +1129,10 @@ const { font, w, h } = fitTextInBox(
     ctx.stroke();
   }
 
-
   // Thinner detail lines
   ctx.lineWidth = 1;
 
   // Weather detail row lines:
-  //  - one line under the condition header
-  //  - one line between each detail row (not under the last row – midY handles that)
   if (detailRowBounds.length > 0) {
     const firstTop = detailRowBounds[0].top;
     ctx.beginPath();
@@ -985,9 +1149,7 @@ const { font, w, h } = fitTextInBox(
     }
   }
 
-  // Location row horizontal lines:
-  //  - one line above the first row
-  //  - one line between each row (bottom of each, except the last)
+  // Location row horizontal lines
   if (locRowBounds.length > 0) {
     const firstTop = locRowBounds[0].top;
     ctx.beginPath();
@@ -1006,10 +1168,8 @@ const { font, w, h } = fitTextInBox(
 
   ctx.restore();
 
-
   return canvas;
 }
-
 
 // ===== Buffers for Kobo + PNG preview =====
 async function buildKoboRawBuffer() {
@@ -1018,9 +1178,9 @@ async function buildKoboRawBuffer() {
   return portrait.toBuffer("raw", { colorType: "Gray8" });
 }
 
-async function buildPngBuffer() {
+async function buildPngBuffer(rotate = true) {
   const landscape = await buildLandscapeCanvas();
-  const portrait = rotateToPortrait(landscape);
+  const portrait =  rotate ? rotateToPortrait(landscape) : landscape;
   return portrait.toBuffer("png");
 }
 
@@ -1038,7 +1198,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.url && req.url.startsWith("/kobo-dashboard.png")) {
-      const png = await buildPngBuffer();
+      const png = await buildPngBuffer(false);
       res.writeHead(200, {
         "Content-Type": "image/png",
         "Content-Length": png.length,
@@ -1061,6 +1221,8 @@ server.listen(BIND_PORT, BIND_HOST, () => {
     `Serving Kobo dashboard on:
   RAW: ${BIND_HOST}:${BIND_PORT}/kobo-dashboard.raw
   PNG: ${BIND_HOST}:${BIND_PORT}/kobo-dashboard.png
-(canvas ${CANVAS_WIDTH}x${CANVAS_HEIGHT} rotated to 600x800, USB on right)`
+(canvas ${CANVAS_WIDTH}x${CANVAS_HEIGHT} rotated to 600x800, USB on right; GPU=${
+      SKIA_USE_GPU ? "on" : "off"
+    })`
   );
 });

@@ -7,6 +7,7 @@
     "start": "node app.js"
   },
   "dependencies": {
-    "skia-canvas": "^2.0.0"
+    "skia-canvas": "^2.0.0",
+    "ws": "^8.18.3"
   }
 }
