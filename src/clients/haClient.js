@@ -26,6 +26,10 @@ const HA_WS_URL = (() => {
     }
 })();
 
+/**
+ * Set state cache from array of states
+ * @param arr
+ */
 function setCacheFromStatesArray(arr) {
     stateCache.clear();
     for (const s of arr || []) {
@@ -38,6 +42,10 @@ function setCacheFromStatesArray(arr) {
     if (stateCache.size > 0) cacheReady = true;
 }
 
+/**
+ * Seed state cache from HA REST API
+ * @returns {Promise<void>}
+ */
 async function seedStatesFromRest() {
     try {
         const res = await fetch(`${HA_URL}/api/states`, {headers: HA_HEADERS});
@@ -52,12 +60,19 @@ async function seedStatesFromRest() {
     }
 }
 
+/**
+ * Send message via WebSocket
+ * @param msg
+ */
 function sendWs(msg) {
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(msg));
     }
 }
 
+/**
+ * Subscribe to state_changed events
+ */
 function subscribeStateChanged() {
     const id = wsIdCounter++;
     sendWs({
@@ -67,6 +82,9 @@ function subscribeStateChanged() {
     });
 }
 
+/**
+ * Schedule WebSocket reconnect
+ */
 function scheduleReconnect() {
     if (wsReconnectTimer) return;
     wsReconnectTimer = setTimeout(() => {
@@ -75,6 +93,10 @@ function scheduleReconnect() {
     }, 5000);
 }
 
+/**
+ * Handle incoming WebSocket message
+ * @param data
+ */
 function handleWsMessage(data) {
     let msg;
     try {
@@ -123,6 +145,9 @@ function handleWsMessage(data) {
     }
 }
 
+/**
+ * Connect to Home Assistant WebSocket API
+ */
 function connectWebSocket() {
     if (!HA_TOKEN) {
         console.warn(
@@ -164,7 +189,9 @@ function connectWebSocket() {
     }
 }
 
-// Call this once from app.js
+/**
+ * Initialize Home Assistant client (WebSocket + state cache)
+ */
 export function initHomeAssistant() {
     connectWebSocket();
     seedStatesFromRest().catch((e) =>
@@ -176,6 +203,11 @@ export function initHomeAssistant() {
 
 // ========= Cache + REST helpers =========
 
+/**
+ * Get state of entity from cache
+ * @param entityId
+ * @returns {(*|{})[]|[null,{}]}
+ */
 function haStateFromCache(entityId) {
     if (!entityId) return [null, {}];
     const entry = stateCache.get(entityId);
@@ -183,7 +215,11 @@ function haStateFromCache(entityId) {
     return [entry.state, entry.attributes || {}];
 }
 
-// Prefer cache; fall back to REST for cold start
+/**
+ * Get state of entity
+ * @param entityId
+ * @returns {Promise<[null,{}]|[null,{}]|*|(*|{})[]|[null,{}]>}
+ */
 export async function haState(entityId) {
     if (!entityId) return [null, {}];
 
@@ -198,6 +234,11 @@ export async function haState(entityId) {
     return [data.state, data.attributes || {}];
 }
 
+/**
+ * Get numeric state of entity
+ * @param entityId
+ * @returns {Promise<(number|*)[]|[null,null,{}]|*[]>}
+ */
 export async function numericState(entityId) {
     if (!entityId) return [null, null, {}];
     try {
@@ -213,6 +254,11 @@ export async function numericState(entityId) {
     }
 }
 
+/**
+ * Get string state of entity
+ * @param entityId
+ * @returns {Promise<[null,{}]|(string|*)[]|*[]>}
+ */
 export async function stringState(entityId) {
     if (!entityId) return [null, {}];
     try {

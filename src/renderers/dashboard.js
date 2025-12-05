@@ -489,7 +489,6 @@ export async function buildLandscapeCanvas() {
             const textY = cy - h / 2 - verticalNudge;
             ctx.fillText(row.label, cx - w / 2, textY);
         }
-
         {
             const {font, w, h} = fitTextInBox(
                 ctx,
